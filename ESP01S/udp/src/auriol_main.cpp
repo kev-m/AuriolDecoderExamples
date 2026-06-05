@@ -202,25 +202,48 @@ void loop()
 
         if (capturedCount >= 32 && capturedCount <= 34)
         {
-            // --- PROFILE A: Temp-Only (32 Bits) ---
-            uint8_t b0 = (capturedFrame >> 24) & 0xFF;
-            uint8_t b1 = (capturedFrame >> 16) & 0xFF; // Stable ID
-            uint8_t b2 = (capturedFrame >> 8) & 0xFF;
-            uint8_t b3 = capturedFrame & 0xFF;
+            // Lambda function to reverse bit order within a single byte
+            auto reverseByte = [](uint8_t b) -> uint8_t
+            {
+                b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+                b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+                b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+                return b;
+            };
 
-            doc["b0"] = b0;
-            doc["b1"] = b1;
-            doc["b2"] = b2;
-            doc["b3"] = b3;
+            // Reverse every byte individually to correct the hardware reflection
+            uint8_t r0 = reverseByte((capturedFrame >> 24) & 0xFF);
+            uint8_t r1 = reverseByte((capturedFrame >> 16) & 0xFF);
+            uint8_t r2 = reverseByte((capturedFrame >> 8) & 0xFF);
+            uint8_t r3 = reverseByte(capturedFrame & 0xFF);
 
+            doc["r0"] = r0;
+            doc["r1"] = r1;
+            doc["r2"] = r2;
+            doc["r3"] = r3;
+
+            // Clean, non-volatile Sensor Session ID assignment
             char idStr[8];
-            snprintf(idStr, sizeof(idStr), "0x%02X", b1);
+            snprintf(idStr, sizeof(idStr), "0x%02X", r0);
             doc["sensor_id"] = idStr;
             doc["type"] = "Temp Only";
 
-            uint16_t raw_temp = (b2 << 4) | (b3 >> 4);
-            doc["raw_temp"] = raw_temp;
-            doc["temperature_c"] = (raw_temp - 400) / 10.0; // Adjust tracking scale as verified
+            // Extract BCD digits from the normalized nibbles
+            // r1 typically holds the tens and units, r2 holds the tenths digit
+            uint8_t tens = (r1 >> 4) & 0x0F;
+            uint8_t units = r1 & 0x0F;
+            uint8_t tenths = (r2 >> 4) & 0x0F;
+
+            float final_temp = (tens * 10.0) + units + (tenths / 10.0);
+
+            // Check for negative flag mask (usually bit 7 of r1 or a flag in r2)
+            if (r2 & 0x0F)
+            {
+                final_temp = -final_temp;
+            }
+
+            doc["temperature_c"] = final_temp;
+            doc["battery"] = (r0 & 0x08) ? "Low" : "OK";
         }
         else if (capturedCount >= 38 && capturedCount <= 44)
         {
