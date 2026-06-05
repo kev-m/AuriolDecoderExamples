@@ -47,84 +47,68 @@ void disableRF()
 }
 
 /////////////////////////////////////////////////////////////////////////////
-#define HALF_BIT_TIMEOUT 500
-#define FULL_BIT_TIMEOUT 1000
-#define TIMING_TOLERANCE 180
+/////////////////////////////////////////////////////////////////////////////
+// New Pulse-Distance Timing Targets (in microseconds)
+#define CYCLE_SHORT_EXPECTED 2400
+#define CYCLE_LONG_EXPECTED 4400
+#define PDM_TOLERANCE 400
 
-// Volatile state storage for the Manchester ISR engine
+// Volatile state storage for the PDM engine
 volatile uint64_t rxBuffer = 0;
 volatile uint8_t bitCount = 0;
 volatile bool packetReady = false;
 
-// --- INSTRUMENTATION METRICS ---
+// Instrumentation tracking
 volatile uint32_t metric_total_edges = 0;
-volatile uint32_t metric_glitches    = 0;
 volatile uint32_t metric_bad_timings = 0;
-volatile uint32_t metric_shorts      = 0;
-volatile uint32_t metric_longs       = 0;
-volatile uint8_t  metric_max_bits    = 0; // Tracks the deepest bit depth reached before a reset
+volatile uint8_t metric_max_bits = 0;
 
-// Minimal ISR: Focuses strictly on edge-timing and bit-shifting
 IRAM_ATTR void rf_edge_isr()
 {
     metric_total_edges++;
-    static unsigned long lastTime = 0;
-    static bool phase = false;
+    static unsigned long lastRisingTime = 0;
 
     unsigned long now = micros();
-    unsigned long duration = now - lastTime;
-    lastTime = now;
+    unsigned long duration = now - lastRisingTime;
+    lastRisingTime = now;
 
-    // Glitch filter for high-frequency ambient RF spikes
-    if (duration < 150) {
-        metric_glitches++;
+    // Glitch protector: ignore edges that double-trigger too fast
+    if (duration < 1000)
         return;
-    }
 
-    bool state = digitalRead(RF_DATA_PIN);
+    // Evaluate the total cycle length from the previous rising edge to this one
+    bool isShort = (duration > (CYCLE_SHORT_EXPECTED - PDM_TOLERANCE) && duration < (CYCLE_SHORT_EXPECTED + PDM_TOLERANCE));
+    bool isLong = (duration > (CYCLE_LONG_EXPECTED - PDM_TOLERANCE) && duration < (CYCLE_LONG_EXPECTED + PDM_TOLERANCE));
 
-    // Timing evaluation windows around 500us and 1000us benchmarks
-    bool isShort = (duration > (HALF_BIT_TIMEOUT - TIMING_TOLERANCE) && duration < (HALF_BIT_TIMEOUT + TIMING_TOLERANCE));
-    bool isLong = (duration > (FULL_BIT_TIMEOUT - TIMING_TOLERANCE) && duration < (FULL_BIT_TIMEOUT + TIMING_TOLERANCE));
-
+    // A packet preamble or sync gap typically presents as a huge duration (>8000us)
     if (!isShort && !isLong)
     {
-        // Log highest bit reached before noise killed the sequence
-        if (bitCount > metric_max_bits) {
-            metric_max_bits = bitCount;
+        // If we hit a sync mark and have collected a clean frame, lock it down.
+        if (bitCount == 32)
+        {
+            packetReady = true;
         }
-        // Drop incomplete chains on sequence violations
-        bitCount = 0;
-        phase = false;
+        else
+        {
+            if (bitCount > metric_max_bits)
+                metric_max_bits = bitCount;
+            bitCount = 0;
+            rxBuffer = 0;
+        }
         metric_bad_timings++;
         return;
     }
-
-    bool sampledBit = state;
-
-    if (isLong)
-    {
-        metric_longs++;
-        phase = true; // Long pulse forces mid-bit tracking window alignment
-    }
-    else
-    {
-        metric_shorts++;
-        if (!phase)
-        {
-            phase = true;
-            return; // Drop boundary edge transition marks
-        }
-        phase = false; // Valid mid-bit cell center achieved; proceed to sample
-    }
-
+    // Shift data bits only if the buffer hasn't been locked by the main loop execution
+    // Inside the bit-shifting block of rf_edge_isr():
     if (!packetReady)
     {
-        rxBuffer = (rxBuffer << 1) | (sampledBit ? 1 : 0);
+        uint8_t sampledBit = isShort ? 1 : 0;
+
+        rxBuffer = (rxBuffer << 1) | sampledBit;
         bitCount++;
 
-        // Auriol V2 payloads stabilize frames across 40 distinct bits
-        if (bitCount >= 40)
+        // Change from 40 to 32
+        if (bitCount >= 32)
         {
             packetReady = true;
         }
@@ -139,7 +123,7 @@ void setup()
 
     // 2. Attach the Manchester edge processing ISR
     pinMode(RF_DATA_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(RF_DATA_PIN), rf_edge_isr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(RF_DATA_PIN), rf_edge_isr, RISING);
 
     // 3. Network initialization
     wifi_enable();
@@ -168,30 +152,21 @@ void loop()
         // Perform an atomic read-and-clear of volatile metric registers
         noInterrupts();
         uint32_t totalEdges = metric_total_edges;
-        uint32_t glitches   = metric_glitches;
         uint32_t badTimings = metric_bad_timings;
-        uint32_t shorts     = metric_shorts;
-        uint32_t longs      = metric_longs;
-        uint8_t  maxBits    = metric_max_bits;
-        
+        uint8_t maxBits = metric_max_bits;
+
         // Reset diagnostic metrics for the next tracking window
         metric_total_edges = 0;
-        metric_glitches    = 0;
         metric_bad_timings = 0;
-        metric_shorts      = 0;
-        metric_longs       = 0;
-        metric_max_bits    = 0;
+        metric_max_bits = 0;
         interrupts();
 
         // Package up diagnostics payload
         JsonDocument statsDoc;
-        statsDoc["type"]         = "rfrx_metrics";
-        statsDoc["total_edges"]  = totalEdges;
-        statsDoc["glitches"]     = glitches;
-        statsDoc["bad_timings"]  = badTimings;
-        statsDoc["valid_shorts"] = shorts;
-        statsDoc["valid_longs"]  = longs;
-        statsDoc["max_bit_depth"]= maxBits;
+        statsDoc["type"] = "rfrx_metrics";
+        statsDoc["total_edges"] = totalEdges;
+        statsDoc["bad_timings"] = badTimings;
+        statsDoc["max_bit_depth"] = maxBits;
 
         char statsBuffer[256];
         serializeJson(statsDoc, statsBuffer);
@@ -201,12 +176,12 @@ void loop()
     // Process valid decoded RF packets caught by the ISR
     if (packetReady)
     {
-        // Detach interrupt memory access safely to extract volatile bits
+        sendDebug(33);
+
         noInterrupts();
         uint64_t capturedFrame = rxBuffer;
         uint8_t capturedCount = bitCount;
 
-        // Clear variables inside atomic window to re-enable background capture
         rxBuffer = 0;
         bitCount = 0;
         packetReady = false;
@@ -214,34 +189,31 @@ void loop()
 
         sendDebug(33);
 
-        // Build the structured telemetry payload
         JsonDocument doc;
 
-        // Output complete 40-bit sequence in a padded hex format for profile matching
+        // Padded to 8 hex chars now for 32-bit visualization
         char hexStr[32];
-        snprintf(hexStr, sizeof(hexStr), "0x%010llX", capturedFrame);
+        snprintf(hexStr, sizeof(hexStr), "0x%08llX", capturedFrame);
         doc["raw_hex"] = hexStr;
         doc["bits_captured"] = capturedCount;
 
-        // Split the frame into separate diagnostic bytes (Bits 39 down to 0)
-        uint8_t b0 = (capturedFrame >> 32) & 0xFF;
-        uint8_t b1 = (capturedFrame >> 24) & 0xFF;
-        uint8_t b2 = (capturedFrame >> 16) & 0xFF;
-        uint8_t b3 = (capturedFrame >> 8) & 0xFF;
-        uint8_t b4 = capturedFrame & 0xFF;
+        // Shift slicing down for 4 bytes (Bits 31 down to 0)
+        uint8_t b0 = (capturedFrame >> 24) & 0xFF;
+        uint8_t b1 = (capturedFrame >> 16) & 0xFF;
+        uint8_t b2 = (capturedFrame >> 8) & 0xFF;
+        uint8_t b3 = capturedFrame & 0xFF;
 
-        // Map individual bytes to payload to easily identify bits via the UDP port
         doc["b0"] = b0;
         doc["b1"] = b1;
         doc["b2"] = b2;
         doc["b3"] = b3;
-        doc["b4"] = b4;
 
-        // --- Standard FineOffset / Auriol V2 Bitmask Baselines ---
+        // --- Standard 32-Bit Protocol Mapping ---
         char idStr[8];
         snprintf(idStr, sizeof(idStr), "0x%02X", b0);
         doc["sensor_id"] = idStr;
 
+        // Temperature Extraction (Typically 12 bits across b1 and b2)
         uint16_t raw_temp = ((b1 & 0x0F) << 8) | b2;
         if (raw_temp & 0x800)
         {
@@ -252,14 +224,16 @@ void loop()
             doc["temperature_c"] = raw_temp / 10.0;
         }
 
+        // Humidity Extraction (Typically maps directly onto byte 3)
         doc["humidity"] = b3;
+
+        // Battery State (Typically flag structures in b1)
         doc["battery"] = (b1 & 0x10) ? "Low" : "OK";
 
         char jsonBuffer[256];
         serializeJson(doc, jsonBuffer);
         sendUdp(jsonBuffer);
     }
-
     // Yield execution to protect core ESP8266 Wi-Fi context layers
     yield();
 }
