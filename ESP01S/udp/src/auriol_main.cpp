@@ -34,6 +34,7 @@ void disableRF();
 // Instantiations
 WiFiClient espClient;
 unsigned long last_reconnect_attempt = 0;
+unsigned long last_stats_report = 0; // Timer tracking for 5-second UDP dump
 
 void enableRF()
 {
@@ -55,9 +56,18 @@ volatile uint64_t rxBuffer = 0;
 volatile uint8_t bitCount = 0;
 volatile bool packetReady = false;
 
+// --- INSTRUMENTATION METRICS ---
+volatile uint32_t metric_total_edges = 0;
+volatile uint32_t metric_glitches    = 0;
+volatile uint32_t metric_bad_timings = 0;
+volatile uint32_t metric_shorts      = 0;
+volatile uint32_t metric_longs       = 0;
+volatile uint8_t  metric_max_bits    = 0; // Tracks the deepest bit depth reached before a reset
+
 // Minimal ISR: Focuses strictly on edge-timing and bit-shifting
 IRAM_ATTR void rf_edge_isr()
 {
+    metric_total_edges++;
     static unsigned long lastTime = 0;
     static bool phase = false;
 
@@ -66,8 +76,10 @@ IRAM_ATTR void rf_edge_isr()
     lastTime = now;
 
     // Glitch filter for high-frequency ambient RF spikes
-    if (duration < 150)
+    if (duration < 150) {
+        metric_glitches++;
         return;
+    }
 
     bool state = digitalRead(RF_DATA_PIN);
 
@@ -77,9 +89,14 @@ IRAM_ATTR void rf_edge_isr()
 
     if (!isShort && !isLong)
     {
+        // Log highest bit reached before noise killed the sequence
+        if (bitCount > metric_max_bits) {
+            metric_max_bits = bitCount;
+        }
         // Drop incomplete chains on sequence violations
         bitCount = 0;
         phase = false;
+        metric_bad_timings++;
         return;
     }
 
@@ -87,10 +104,12 @@ IRAM_ATTR void rf_edge_isr()
 
     if (isLong)
     {
+        metric_longs++;
         phase = true; // Long pulse forces mid-bit tracking window alignment
     }
     else
     {
+        metric_shorts++;
         if (!phase)
         {
             phase = true;
@@ -136,6 +155,49 @@ void loop()
         ArduinoOTA.handle();
     }
 
+    unsigned long currentMillis = millis();
+
+    // Periodic 5-second instrumentation diagnostics report
+    if (currentMillis - last_stats_report >= 5000)
+    {
+        // Prepare for payload
+        sendDebug(34);
+
+        last_stats_report = currentMillis;
+
+        // Perform an atomic read-and-clear of volatile metric registers
+        noInterrupts();
+        uint32_t totalEdges = metric_total_edges;
+        uint32_t glitches   = metric_glitches;
+        uint32_t badTimings = metric_bad_timings;
+        uint32_t shorts     = metric_shorts;
+        uint32_t longs      = metric_longs;
+        uint8_t  maxBits    = metric_max_bits;
+        
+        // Reset diagnostic metrics for the next tracking window
+        metric_total_edges = 0;
+        metric_glitches    = 0;
+        metric_bad_timings = 0;
+        metric_shorts      = 0;
+        metric_longs       = 0;
+        metric_max_bits    = 0;
+        interrupts();
+
+        // Package up diagnostics payload
+        JsonDocument statsDoc;
+        statsDoc["type"]         = "rfrx_metrics";
+        statsDoc["total_edges"]  = totalEdges;
+        statsDoc["glitches"]     = glitches;
+        statsDoc["bad_timings"]  = badTimings;
+        statsDoc["valid_shorts"] = shorts;
+        statsDoc["valid_longs"]  = longs;
+        statsDoc["max_bit_depth"]= maxBits;
+
+        char statsBuffer[256];
+        serializeJson(statsDoc, statsBuffer);
+        sendUdp(statsBuffer);
+    }
+
     // Process valid decoded RF packets caught by the ISR
     if (packetReady)
     {
@@ -176,13 +238,10 @@ void loop()
         doc["b4"] = b4;
 
         // --- Standard FineOffset / Auriol V2 Bitmask Baselines ---
-        // ID Generation (Usually the upper byte or combined rolling nibbles)
         char idStr[8];
         snprintf(idStr, sizeof(idStr), "0x%02X", b0);
         doc["sensor_id"] = idStr;
 
-        // Temperature Extraction (Typically a 12-bit string spanning b1 and b2)
-        // Bit 11 of raw_temp acts as the negative sign bit indicator
         uint16_t raw_temp = ((b1 & 0x0F) << 8) | b2;
         if (raw_temp & 0x800)
         {
@@ -193,13 +252,9 @@ void loop()
             doc["temperature_c"] = raw_temp / 10.0;
         }
 
-        // Humidity Extraction (Typically maps directly onto byte 3)
         doc["humidity"] = b3;
-
-        // Battery State (Typically evaluated via flag structures in byte 1)
         doc["battery"] = (b1 & 0x10) ? "Low" : "OK";
 
-        // Serialize and pipe to your UDP port listener
         char jsonBuffer[256];
         serializeJson(doc, jsonBuffer);
         sendUdp(jsonBuffer);
