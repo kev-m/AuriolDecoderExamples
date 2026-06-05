@@ -84,16 +84,18 @@ IRAM_ATTR void rf_edge_isr()
     // A packet preamble or sync gap typically presents as a huge duration (>8000us)
     if (!isShort && !isLong)
     {
+        // Always track the deepest frame seen, whether it succeeds or not
+        if (bitCount > metric_max_bits)
+            metric_max_bits = bitCount;
+
         // Trailing Sync Gap: If we've collected a plausible data frame size,
         // flag it as complete for the main loop to evaluate.
-        if (bitCount >= 32 && bitCount <= 44)
+        if (bitCount >= 28 && bitCount <= 44)
         {
             packetReady = true;
         }
         else
         {
-            if (bitCount > metric_max_bits)
-                metric_max_bits = bitCount;
             bitCount = 0;
             rxBuffer = 0;
         }
@@ -200,7 +202,7 @@ void loop()
         snprintf(hexStr, sizeof(hexStr), "0x%011llX", capturedFrame);
         doc["raw_hex"] = hexStr;
 
-        if (capturedCount >= 32 && capturedCount <= 34)
+        if (capturedCount >= 28 && capturedCount <= 34)
         {
             // Lambda function to reverse bit order within a single byte
             auto reverseByte = [](uint8_t b) -> uint8_t
@@ -222,9 +224,10 @@ void loop()
             doc["r2"] = r2;
             doc["r3"] = r3;
 
-            // Clean, non-volatile Sensor Session ID assignment
+            // r3 = first transmitted byte = sensor rolling ID
+            // r0 = last transmitted byte = checksum (varies per burst)
             char idStr[8];
-            snprintf(idStr, sizeof(idStr), "0x%02X", r0);
+            snprintf(idStr, sizeof(idStr), "0x%02X", r3);
             doc["sensor_id"] = idStr;
             doc["type"] = "Temp Only";
 
@@ -237,7 +240,8 @@ void loop()
             float final_temp = raw_temp / 10.0;
 
             doc["temperature_c"] = final_temp;
-            doc["battery"] = (r0 & 0x08) ? "Low" : "OK";
+            // r2 bit 7 = battery low flag; bit 6 = TX sequence counter (toggles each burst)
+            doc["battery"] = (r2 & 0x80) ? "Low" : "OK";
         }
         else if (capturedCount >= 38 && capturedCount <= 44)
         {
