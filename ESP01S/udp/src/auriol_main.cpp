@@ -63,6 +63,7 @@ volatile uint32_t metric_total_edges = 0;
 volatile uint32_t metric_bad_timings = 0;
 volatile uint8_t metric_max_bits = 0;
 
+// Increase buffer to handle up to 64 bits seamlessly
 IRAM_ATTR void rf_edge_isr()
 {
     metric_total_edges++;
@@ -74,7 +75,7 @@ IRAM_ATTR void rf_edge_isr()
 
     // Glitch protector: ignore edges that double-trigger too fast
     if (duration < 1000)
-        return;
+        return; // Ignore fast double-triggers
 
     // Evaluate the total cycle length from the previous rising edge to this one
     bool isShort = (duration > (CYCLE_SHORT_EXPECTED - PDM_TOLERANCE) && duration < (CYCLE_SHORT_EXPECTED + PDM_TOLERANCE));
@@ -83,8 +84,9 @@ IRAM_ATTR void rf_edge_isr()
     // A packet preamble or sync gap typically presents as a huge duration (>8000us)
     if (!isShort && !isLong)
     {
-        // If we hit a sync mark and have collected a clean frame, lock it down.
-        if (bitCount == 32)
+        // Trailing Sync Gap: If we've collected a plausible data frame size,
+        // flag it as complete for the main loop to evaluate.
+        if (bitCount >= 32 && bitCount <= 44)
         {
             packetReady = true;
         }
@@ -102,15 +104,17 @@ IRAM_ATTR void rf_edge_isr()
     // Inside the bit-shifting block of rf_edge_isr():
     if (!packetReady)
     {
-        uint8_t sampledBit = isShort ? 1 : 0;
+        uint8_t sampledBit = isLong ? 1 : 0;
 
-        rxBuffer = (rxBuffer << 1) | sampledBit;
+        // Pack LSB-First: Always shift incoming bits into the highest slot
+        rxBuffer = (rxBuffer >> 1) | ((uint64_t)sampledBit << 63);
         bitCount++;
 
-        // Change from 40 to 32
-        if (bitCount >= 32)
+        // Safety hard stop if noise runs wild
+        if (bitCount >= 60)
         {
-            packetReady = true;
+            bitCount = 0;
+            rxBuffer = 0;
         }
     }
 }
@@ -176,8 +180,6 @@ void loop()
     // Process valid decoded RF packets caught by the ISR
     if (packetReady)
     {
-        sendDebug(33);
-
         noInterrupts();
         uint64_t capturedFrame = rxBuffer;
         uint8_t capturedCount = bitCount;
@@ -187,48 +189,66 @@ void loop()
         packetReady = false;
         interrupts();
 
-        sendDebug(33);
+        // Right-align the payload bits inside a working 64-bit space
+        // because LSB packing places shorter streams on the left side (MSB end)
+        capturedFrame = capturedFrame >> (64 - capturedCount);
 
         JsonDocument doc;
-
-        // Padded to 8 hex chars now for 32-bit visualization
-        char hexStr[32];
-        snprintf(hexStr, sizeof(hexStr), "0x%08llX", capturedFrame);
-        doc["raw_hex"] = hexStr;
         doc["bits_captured"] = capturedCount;
 
-        // Shift slicing down for 4 bytes (Bits 31 down to 0)
-        uint8_t b0 = (capturedFrame >> 24) & 0xFF;
-        uint8_t b1 = (capturedFrame >> 16) & 0xFF;
-        uint8_t b2 = (capturedFrame >> 8) & 0xFF;
-        uint8_t b3 = capturedFrame & 0xFF;
+        char hexStr[32];
+        snprintf(hexStr, sizeof(hexStr), "0x%011llX", capturedFrame);
+        doc["raw_hex"] = hexStr;
 
-        doc["b0"] = b0;
-        doc["b1"] = b1;
-        doc["b2"] = b2;
-        doc["b3"] = b3;
-
-        // --- Standard 32-Bit Protocol Mapping ---
-        char idStr[8];
-        snprintf(idStr, sizeof(idStr), "0x%02X", b0);
-        doc["sensor_id"] = idStr;
-
-        // Temperature Extraction (Typically 12 bits across b1 and b2)
-        uint16_t raw_temp = ((b1 & 0x0F) << 8) | b2;
-        if (raw_temp & 0x800)
+        if (capturedCount >= 32 && capturedCount <= 34)
         {
-            doc["temperature_c"] = -((raw_temp & 0x7FF) / 10.0);
+            // --- PROFILE A: Temp-Only (32 Bits) ---
+            uint8_t b0 = (capturedFrame >> 24) & 0xFF;
+            uint8_t b1 = (capturedFrame >> 16) & 0xFF; // Stable ID
+            uint8_t b2 = (capturedFrame >> 8) & 0xFF;
+            uint8_t b3 = capturedFrame & 0xFF;
+
+            doc["b0"] = b0;
+            doc["b1"] = b1;
+            doc["b2"] = b2;
+            doc["b3"] = b3;
+
+            char idStr[8];
+            snprintf(idStr, sizeof(idStr), "0x%02X", b1);
+            doc["sensor_id"] = idStr;
+            doc["type"] = "Temp Only";
+
+            uint16_t raw_temp = (b2 << 4) | (b3 >> 4);
+            doc["raw_temp"] = raw_temp;
+            doc["temperature_c"] = (raw_temp - 400) / 10.0; // Adjust tracking scale as verified
         }
-        else
+        else if (capturedCount >= 38 && capturedCount <= 44)
         {
-            doc["temperature_c"] = raw_temp / 10.0;
+            // --- PROFILE B: Temp & Humidity Combined (Typically 40 Bits) ---
+            uint8_t b0 = (capturedFrame >> 32) & 0xFF;
+            uint8_t b1 = (capturedFrame >> 24) & 0xFF; // Stable ID
+            uint8_t b2 = (capturedFrame >> 16) & 0xFF;
+            uint8_t b3 = (capturedFrame >> 8) & 0xFF;
+            uint8_t b4 = capturedFrame & 0xFF;
+
+            doc["b0"] = b0;
+            doc["b1"] = b1;
+            doc["b2"] = b2;
+            doc["b3"] = b3;
+            doc["b4"] = b4;
+
+            char idStr[8];
+            snprintf(idStr, sizeof(idStr), "0x%02X", b1);
+            doc["sensor_id"] = idStr;
+            doc["type"] = "Temp + Hum";
+
+            // Combined extraction block for longer variant mapping
+            uint16_t raw_temp = (b2 << 4) | (b3 >> 4);
+            doc["temperature_c"] = (raw_temp - 400) / 10.0;
+
+            // Extract humidity (usually maps cleanly on b3 trailing nibble or b4)
+            doc["humidity"] = b4;
         }
-
-        // Humidity Extraction (Typically maps directly onto byte 3)
-        doc["humidity"] = b3;
-
-        // Battery State (Typically flag structures in b1)
-        doc["battery"] = (b1 & 0x10) ? "Low" : "OK";
 
         char jsonBuffer[256];
         serializeJson(doc, jsonBuffer);
