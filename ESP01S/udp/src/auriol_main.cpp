@@ -228,19 +228,13 @@ void loop()
             doc["sensor_id"] = idStr;
             doc["type"] = "Temp Only";
 
-            // Extract BCD digits from the normalized nibbles
-            // r1 typically holds the tens and units, r2 holds the tenths digit
-            uint8_t tens = (r1 >> 4) & 0x0F;
-            uint8_t units = r1 & 0x0F;
-            uint8_t tenths = (r2 >> 4) & 0x0F;
+            // Auriol protocol: byte1=r2 carries batt+channel+temp_MSB_nibble,
+            // byte2=r1 carries temp LSB byte. Together they form a 12-bit signed
+            // temperature value in units of 0.1°C (two's complement).
+            int16_t raw_temp = ((int16_t)(r2 & 0x0F) << 8) | r1;
+            if (raw_temp >= 2048) raw_temp -= 4096; // sign-extend 12-bit to 16-bit
 
-            float final_temp = (tens * 10.0) + units + (tenths / 10.0);
-
-            // Check for negative flag mask (usually bit 7 of r1 or a flag in r2)
-            if (r2 & 0x0F)
-            {
-                final_temp = -final_temp;
-            }
+            float final_temp = raw_temp / 10.0;
 
             doc["temperature_c"] = final_temp;
             doc["battery"] = (r0 & 0x08) ? "Low" : "OK";
