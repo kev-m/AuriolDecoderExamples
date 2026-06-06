@@ -56,6 +56,7 @@ void disableRF()
 
 #define GLITCH_MIN_US 600
 #define TRAIN_RESET_US 15000
+#define TRAIN_RESET_HOLD_COUNT 3
 #define PROFILE_LOCK_MIN_SAMPLES 12
 #define PROFILE_LOCK_FORCE_SAMPLES 24
 #define PACKET_MIN_BITS 26
@@ -85,6 +86,8 @@ uint32_t metric_packet_candidates = 0;
 uint32_t metric_packet_invalid_len = 0;
 uint32_t metric_repeat_hits = 0;
 uint32_t metric_consensus_hits = 0;
+uint32_t metric_type1_decode_ok = 0;
+uint32_t metric_type1_decode_unknown = 0;
 uint8_t metric_max_bits = 0;
 
 enum DecoderProfile : uint8_t
@@ -104,10 +107,12 @@ uint64_t lastCandidateBits = 0;
 uint8_t lastCandidateBitsCount = 0;
 DecoderProfile lastCandidateProfile = PROFILE_UNKNOWN;
 uint8_t lastCandidateRepeatCount = 0;
+bool lastCandidateConsensusSent = false;
 
 uint32_t lockScoreType1 = 0;
 uint32_t lockScoreType2 = 0;
 uint8_t lockSamples = 0;
+uint8_t trainResetStreak = 0;
 
 static inline uint16_t absDiffU16(uint16_t a, uint16_t b)
 {
@@ -158,14 +163,25 @@ static inline void resetPacketAssembler()
     workBitCount = 0;
 }
 
+static inline void resetCandidateHistory()
+{
+    lastCandidateBits = 0;
+    lastCandidateBitsCount = 0;
+    lastCandidateProfile = PROFILE_UNKNOWN;
+    lastCandidateRepeatCount = 0;
+    lastCandidateConsensusSent = false;
+}
+
 static inline void resetProfileLock()
 {
     activeProfile = PROFILE_UNKNOWN;
     lockScoreType1 = 0;
     lockScoreType2 = 0;
     lockSamples = 0;
+    trainResetStreak = 0;
     waitForPacketStart = true;
     resetPacketAssembler();
+    resetCandidateHistory();
 }
 
 static inline bool popIsrDuration(uint16_t *outDt)
@@ -204,7 +220,64 @@ void emitDecoderEvent(const char *eventType, uint16_t dt, bool includePacket)
     sendUdp(jsonBuffer);
 }
 
-static inline void finalizeCandidate(uint16_t boundaryDt)
+static inline void emitType1DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint16_t boundaryDt)
+{
+    JsonDocument doc;
+    doc["type"] = "type1_decode";
+    doc["profile"] = "type1";
+    doc["dt_us"] = boundaryDt;
+    doc["bits_captured"] = bitCount;
+
+    char hexStr[32];
+    snprintf(hexStr, sizeof(hexStr), "0x%016llX", rawBits);
+    doc["raw_hex"] = hexStr;
+
+    if (bitCount != 32)
+    {
+        doc["decoded"] = false;
+        doc["reason"] = "unexpected_bit_length";
+        metric_type1_decode_unknown++;
+    }
+    else
+    {
+        uint32_t raw32 = (uint32_t)(rawBits & 0xFFFFFFFFUL);
+        uint8_t b0 = (raw32 >> 24) & 0xFF;
+        uint8_t b1 = (raw32 >> 16) & 0xFF;
+        uint8_t b2 = (raw32 >> 8) & 0xFF;
+        uint8_t b3 = raw32 & 0xFF;
+
+        // Type 1: b1 low nibble + b2 forms signed 12-bit temp in 0.1C steps.
+        int16_t rawTemp = ((int16_t)(b1 & 0x0F) << 8) | b2;
+        if (rawTemp >= 2048)
+            rawTemp -= 4096;
+
+        float finalTemp = rawTemp / 10.0f;
+
+        doc["decoded"] = true;
+        doc["temperature_c"] = finalTemp;
+        doc["battery"] = (b0 & 0x80) ? "Low" : "OK";
+
+        char idStr[8];
+        snprintf(idStr, sizeof(idStr), "0x%02X", b0);
+        doc["sensor_id"] = idStr;
+        doc["checksum"] = b3;
+
+        if (b0 == 0x0C)
+            doc["sender"] = "inside";
+        else if (b0 == 0xE6)
+            doc["sender"] = "outside";
+        else
+            doc["sender"] = "unknown";
+
+        metric_type1_decode_ok++;
+    }
+
+    char jsonBuffer[256];
+    serializeJson(doc, jsonBuffer);
+    sendUdp(jsonBuffer);
+}
+
+static inline void finalizeCandidate(uint16_t boundaryDt, bool allowEmit)
 {
     if (workBitCount == 0)
         return;
@@ -235,16 +308,24 @@ static inline void finalizeCandidate(uint16_t boundaryDt)
         lastCandidateBitsCount = workBitCount;
         lastCandidateBits = workBits;
         lastCandidateRepeatCount = 1;
+        lastCandidateConsensusSent = false;
     }
 
-    if (lastCandidateRepeatCount >= 2)
+    if (allowEmit && lastCandidateRepeatCount == 1)
+    {
+        emitDecoderEvent("decoder_candidate", boundaryDt, true);
+    }
+
+    if (allowEmit && lastCandidateRepeatCount >= 2 && !lastCandidateConsensusSent)
     {
         metric_consensus_hits++;
         emitDecoderEvent("decoder_consensus", boundaryDt, true);
-    }
-    else
-    {
-        emitDecoderEvent("decoder_candidate", boundaryDt, true);
+
+        // Process payloads only on first consensus event.
+        if (activeProfile == PROFILE_TYPE1)
+            emitType1DecodeEvent(workBits, workBitCount, boundaryDt);
+
+        lastCandidateConsensusSent = true;
     }
 
     resetPacketAssembler();
@@ -317,11 +398,25 @@ void loop()
 
         if (dt >= TRAIN_RESET_US)
         {
-            metric_train_resets++;
-            finalizeCandidate(dt);
-            resetProfileLock();
+            if (activeProfile != PROFILE_UNKNOWN || workBitCount > 0)
+                metric_train_resets++;
+
+            // Train reset boundaries are state transitions, not packet events.
+            finalizeCandidate(dt, false);
+            resetPacketAssembler();
+            waitForPacketStart = true;
+            resetCandidateHistory();
+
+            if (trainResetStreak < 255)
+                trainResetStreak++;
+
+            // Hold lock for a few long silences to reduce profile flapping.
+            if (trainResetStreak >= TRAIN_RESET_HOLD_COUNT)
+                resetProfileLock();
             continue;
         }
+
+        trainResetStreak = 0;
 
         if (activeProfile == PROFILE_UNKNOWN)
         {
@@ -351,6 +446,7 @@ void loop()
             {
                 activeProfile = (lockScoreType1 <= lockScoreType2) ? PROFILE_TYPE1 : PROFILE_TYPE2;
                 waitForPacketStart = true;
+                resetCandidateHistory();
                 if (activeProfile == PROFILE_TYPE1)
                     metric_profile_locks_type1++;
                 else
@@ -392,7 +488,7 @@ void loop()
             }
             else
             {
-                finalizeCandidate(dt);
+                    finalizeCandidate(dt, true);
             }
             continue;
         }
@@ -423,6 +519,8 @@ void loop()
         uint32_t packetInvalidLen = metric_packet_invalid_len;
         uint32_t repeatHits = metric_repeat_hits;
         uint32_t consensusHits = metric_consensus_hits;
+        uint32_t type1DecodeOk = metric_type1_decode_ok;
+        uint32_t type1DecodeUnknown = metric_type1_decode_unknown;
         uint8_t maxBits = metric_max_bits;
 
         // Reset diagnostic metrics for the next tracking window
@@ -439,6 +537,8 @@ void loop()
         metric_packet_invalid_len = 0;
         metric_repeat_hits = 0;
         metric_consensus_hits = 0;
+        metric_type1_decode_ok = 0;
+        metric_type1_decode_unknown = 0;
         metric_max_bits = 0;
         interrupts();
 
@@ -458,6 +558,8 @@ void loop()
         statsDoc["packet_invalid_len"] = packetInvalidLen;
         statsDoc["repeat_hits"] = repeatHits;
         statsDoc["consensus_hits"] = consensusHits;
+        statsDoc["type1_decode_ok"] = type1DecodeOk;
+        statsDoc["type1_decode_unknown"] = type1DecodeUnknown;
         statsDoc["max_bit_depth"] = maxBits;
         statsDoc["active_profile"] = (activeProfile == PROFILE_TYPE1) ? "type1" : ((activeProfile == PROFILE_TYPE2) ? "type2" : "unknown");
         statsDoc["wait_for_packet_start"] = waitForPacketStart;
