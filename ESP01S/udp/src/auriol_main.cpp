@@ -88,6 +88,8 @@ uint32_t metric_repeat_hits = 0;
 uint32_t metric_consensus_hits = 0;
 uint32_t metric_type1_decode_ok = 0;
 uint32_t metric_type1_decode_unknown = 0;
+uint32_t metric_type2_decode_ok = 0;
+uint32_t metric_type2_decode_unknown = 0;
 uint8_t metric_max_bits = 0;
 
 enum DecoderProfile : uint8_t
@@ -277,6 +279,65 @@ static inline void emitType1DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint
     sendUdp(jsonBuffer);
 }
 
+static inline void emitType2DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint16_t boundaryDt)
+{
+    JsonDocument doc;
+    doc["type"] = "type2_decode";
+    doc["profile"] = "type2";
+    doc["dt_us"] = boundaryDt;
+    doc["bits_captured"] = bitCount;
+
+    char hexStr[32];
+    snprintf(hexStr, sizeof(hexStr), "0x%016llX", rawBits);
+    doc["raw_hex"] = hexStr;
+
+    if (bitCount != 36)
+    {
+        doc["decoded"] = false;
+        doc["reason"] = "unexpected_bit_length";
+        metric_type2_decode_unknown++;
+    }
+    else
+    {
+        // Treat the 36-bit payload as 9 nibbles: n0..n8 (MSB to LSB).
+        uint64_t raw36 = rawBits & 0xFFFFFFFFFULL;
+        uint8_t n0 = (raw36 >> 32) & 0x0F;
+        uint8_t n1 = (raw36 >> 28) & 0x0F;
+        uint8_t n2 = (raw36 >> 24) & 0x0F;
+        uint8_t n3 = (raw36 >> 20) & 0x0F;
+        uint8_t n4 = (raw36 >> 16) & 0x0F;
+        uint8_t n5 = (raw36 >> 12) & 0x0F;
+        uint8_t n7 = (raw36 >> 4) & 0x0F;
+        uint8_t n8 = raw36 & 0x0F;
+
+        uint16_t rawTemp = ((uint16_t)n3 << 8) | ((uint16_t)n4 << 4) | n5;
+        float finalTemp = rawTemp / 10.0f;
+
+        // Updated mapping from validated captures:
+        // humidity maps directly to the low byte, channel maps from n2 LSB.
+        uint8_t humidityWire = (uint8_t)((n7 << 4) | n8);
+        uint8_t humidity = humidityWire;
+        uint8_t channel = (n2 & 0x03) + 1;
+
+        doc["decoded"] = true;
+        doc["temperature_c"] = finalTemp;
+        doc["humidity"] = humidity;
+        doc["channel"] = channel;
+        doc["humidity_wire"] = humidityWire;
+        doc["decode_model"] = "provisional";
+
+        char idStr[8];
+        snprintf(idStr, sizeof(idStr), "0x%01X%01X", n0, n1);
+        doc["sensor_id"] = idStr;
+
+        metric_type2_decode_ok++;
+    }
+
+    char jsonBuffer[256];
+    serializeJson(doc, jsonBuffer);
+    sendUdp(jsonBuffer);
+}
+
 static inline void finalizeCandidate(uint16_t boundaryDt, bool allowEmit)
 {
     if (workBitCount == 0)
@@ -324,6 +385,8 @@ static inline void finalizeCandidate(uint16_t boundaryDt, bool allowEmit)
         // Process payloads only on first consensus event.
         if (activeProfile == PROFILE_TYPE1)
             emitType1DecodeEvent(workBits, workBitCount, boundaryDt);
+            else if (activeProfile == PROFILE_TYPE2)
+                emitType2DecodeEvent(workBits, workBitCount, boundaryDt);
 
         lastCandidateConsensusSent = true;
     }
@@ -521,6 +584,8 @@ void loop()
         uint32_t consensusHits = metric_consensus_hits;
         uint32_t type1DecodeOk = metric_type1_decode_ok;
         uint32_t type1DecodeUnknown = metric_type1_decode_unknown;
+        uint32_t type2DecodeOk = metric_type2_decode_ok;
+        uint32_t type2DecodeUnknown = metric_type2_decode_unknown;
         uint8_t maxBits = metric_max_bits;
 
         // Reset diagnostic metrics for the next tracking window
@@ -539,6 +604,8 @@ void loop()
         metric_consensus_hits = 0;
         metric_type1_decode_ok = 0;
         metric_type1_decode_unknown = 0;
+        metric_type2_decode_ok = 0;
+        metric_type2_decode_unknown = 0;
         metric_max_bits = 0;
         interrupts();
 
@@ -560,6 +627,8 @@ void loop()
         statsDoc["consensus_hits"] = consensusHits;
         statsDoc["type1_decode_ok"] = type1DecodeOk;
         statsDoc["type1_decode_unknown"] = type1DecodeUnknown;
+        statsDoc["type2_decode_ok"] = type2DecodeOk;
+        statsDoc["type2_decode_unknown"] = type2DecodeUnknown;
         statsDoc["max_bit_depth"] = maxBits;
         statsDoc["active_profile"] = (activeProfile == PROFILE_TYPE1) ? "type1" : ((activeProfile == PROFILE_TYPE2) ? "type2" : "unknown");
         statsDoc["wait_for_packet_start"] = waitForPacketStart;
