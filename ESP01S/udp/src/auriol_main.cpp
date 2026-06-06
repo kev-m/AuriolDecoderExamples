@@ -45,7 +45,9 @@ void disableRF()
 {
     digitalWrite(RX_POWER_PIN, HIGH);
 }
-
+/////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+static bool debug = false;
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
 // Pulse timing in microseconds
@@ -61,6 +63,7 @@ void disableRF()
 #define PROFILE_LOCK_FORCE_SAMPLES 24
 #define PACKET_MIN_BITS 26
 #define PACKET_MAX_BITS 52
+#define DECODE_DUP_SUPPRESS_MS 1500
 
 // ISR queue: timing deltas only, decode in loop() to keep ISR tiny.
 #define ISR_QUEUE_SIZE 128
@@ -90,6 +93,7 @@ uint32_t metric_type1_decode_ok = 0;
 uint32_t metric_type1_decode_unknown = 0;
 uint32_t metric_type2_decode_ok = 0;
 uint32_t metric_type2_decode_unknown = 0;
+uint32_t metric_decode_duplicate_suppressed = 0;
 uint8_t metric_max_bits = 0;
 
 enum DecoderProfile : uint8_t
@@ -115,6 +119,31 @@ uint32_t lockScoreType1 = 0;
 uint32_t lockScoreType2 = 0;
 uint8_t lockSamples = 0;
 uint8_t trainResetStreak = 0;
+
+DecoderProfile lastPublishedProfile = PROFILE_UNKNOWN;
+uint64_t lastPublishedRawBits = 0;
+uint8_t lastPublishedBitCount = 0;
+unsigned long lastPublishedMs = 0;
+
+static inline bool shouldSuppressDecodedPublish(DecoderProfile profile, uint64_t rawBits, uint8_t bitCount)
+{
+    unsigned long now = millis();
+    bool samePayload = (lastPublishedProfile == profile &&
+                        lastPublishedRawBits == rawBits &&
+                        lastPublishedBitCount == bitCount);
+
+    if (samePayload && (now - lastPublishedMs) <= DECODE_DUP_SUPPRESS_MS)
+    {
+        metric_decode_duplicate_suppressed++;
+        return true;
+    }
+
+    lastPublishedProfile = profile;
+    lastPublishedRawBits = rawBits;
+    lastPublishedBitCount = bitCount;
+    lastPublishedMs = now;
+    return false;
+}
 
 static inline uint16_t absDiffU16(uint16_t a, uint16_t b)
 {
@@ -202,6 +231,8 @@ static inline bool popIsrDuration(uint16_t *outDt)
 
 void emitDecoderEvent(const char *eventType, uint16_t dt, bool includePacket)
 {
+    if (!debug)
+        return;
     JsonDocument doc;
     doc["type"] = eventType;
     doc["dt_us"] = dt;
@@ -224,8 +255,11 @@ void emitDecoderEvent(const char *eventType, uint16_t dt, bool includePacket)
 
 static inline void emitType1DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint16_t boundaryDt)
 {
+    if (shouldSuppressDecodedPublish(PROFILE_TYPE1, rawBits, bitCount))
+        return;
+
     JsonDocument doc;
-    doc["type"] = "type1_decode";
+    doc["type"] = "Auriol";
     doc["profile"] = "type1";
     doc["dt_us"] = boundaryDt;
     doc["bits_captured"] = bitCount;
@@ -264,13 +298,6 @@ static inline void emitType1DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint
         doc["sensor_id"] = idStr;
         doc["checksum"] = b3;
 
-        if (b0 == 0x0C)
-            doc["sender"] = "inside";
-        else if (b0 == 0xE6)
-            doc["sender"] = "outside";
-        else
-            doc["sender"] = "unknown";
-
         metric_type1_decode_ok++;
     }
 
@@ -281,8 +308,11 @@ static inline void emitType1DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint
 
 static inline void emitType2DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint16_t boundaryDt)
 {
+    if (shouldSuppressDecodedPublish(PROFILE_TYPE2, rawBits, bitCount))
+        return;
+
     JsonDocument doc;
-    doc["type"] = "type2_decode";
+    doc["type"] = "Auriol";
     doc["profile"] = "type2";
     doc["dt_us"] = boundaryDt;
     doc["bits_captured"] = bitCount;
@@ -315,16 +345,13 @@ static inline void emitType2DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint
 
         // Updated mapping from validated captures:
         // humidity maps directly to the low byte, channel maps from n2 LSB.
-        uint8_t humidityWire = (uint8_t)((n7 << 4) | n8);
-        uint8_t humidity = humidityWire;
+        uint8_t humidity = (uint8_t)((n7 << 4) | n8);
         uint8_t channel = (n2 & 0x03) + 1;
 
         doc["decoded"] = true;
         doc["temperature_c"] = finalTemp;
         doc["humidity"] = humidity;
         doc["channel"] = channel;
-        doc["humidity_wire"] = humidityWire;
-        doc["decode_model"] = "provisional";
 
         char idStr[8];
         snprintf(idStr, sizeof(idStr), "0x%01X%01X", n0, n1);
@@ -561,7 +588,7 @@ void loop()
 
     // Periodic 5-second instrumentation diagnostics report
     bool stats = false;
-    if (stats & currentMillis - last_stats_report >= 5000)
+    if (stats && (currentMillis - last_stats_report >= 5000))
     {
         // Prepare for payload
         sendDebug(34);
@@ -587,6 +614,7 @@ void loop()
         uint32_t type1DecodeUnknown = metric_type1_decode_unknown;
         uint32_t type2DecodeOk = metric_type2_decode_ok;
         uint32_t type2DecodeUnknown = metric_type2_decode_unknown;
+        uint32_t duplicateSuppressed = metric_decode_duplicate_suppressed;
         uint8_t maxBits = metric_max_bits;
 
         // Reset diagnostic metrics for the next tracking window
@@ -607,6 +635,7 @@ void loop()
         metric_type1_decode_unknown = 0;
         metric_type2_decode_ok = 0;
         metric_type2_decode_unknown = 0;
+        metric_decode_duplicate_suppressed = 0;
         metric_max_bits = 0;
         interrupts();
 
@@ -630,6 +659,7 @@ void loop()
         statsDoc["type1_decode_unknown"] = type1DecodeUnknown;
         statsDoc["type2_decode_ok"] = type2DecodeOk;
         statsDoc["type2_decode_unknown"] = type2DecodeUnknown;
+        statsDoc["decode_duplicate_suppressed"] = duplicateSuppressed;
         statsDoc["max_bit_depth"] = maxBits;
         statsDoc["active_profile"] = (activeProfile == PROFILE_TYPE1) ? "type1" : ((activeProfile == PROFILE_TYPE2) ? "type2" : "unknown");
         statsDoc["wait_for_packet_start"] = waitForPacketStart;
