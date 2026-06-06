@@ -48,77 +48,239 @@ void disableRF()
 
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
-// New Pulse-Distance Timing Targets (in microseconds)
-#define CYCLE_SHORT_EXPECTED 2400
-#define CYCLE_LONG_EXPECTED 4400
-#define PDM_TOLERANCE 400
+// Pulse timing in microseconds
+#define TYPE1_SHORT_US 2400
+#define TYPE1_LONG_US 4400
+#define TYPE2_SHORT_US 1400
+#define TYPE2_LONG_US 2400
 
-// Volatile state storage for the PDM engine
-volatile uint64_t rxBuffer = 0;
-volatile uint8_t bitCount = 0;
-volatile bool packetReady = false;
+#define GLITCH_MIN_US 600
+#define TRAIN_RESET_US 15000
+#define PROFILE_LOCK_MIN_SAMPLES 12
+#define PROFILE_LOCK_FORCE_SAMPLES 24
+#define PACKET_MIN_BITS 26
+#define PACKET_MAX_BITS 52
 
-// Instrumentation tracking
+// ISR queue: timing deltas only, decode in loop() to keep ISR tiny.
+#define ISR_QUEUE_SIZE 128
+#define ISR_QUEUE_MASK (ISR_QUEUE_SIZE - 1)
+
+volatile uint16_t isrDurations[ISR_QUEUE_SIZE];
+volatile uint8_t isrHead = 0;
+volatile uint8_t isrTail = 0;
+
+// ISR instrumentation
 volatile uint32_t metric_total_edges = 0;
-volatile uint32_t metric_bad_timings = 0;
-volatile uint8_t metric_max_bits = 0;
+volatile uint32_t metric_glitch_edges = 0;
+volatile uint32_t metric_queue_overflow = 0;
 
-// Increase buffer to handle up to 64 bits seamlessly
+// Loop-side instrumentation
+uint32_t metric_processed_intervals = 0;
+uint32_t metric_bad_intervals = 0;
+uint32_t metric_train_resets = 0;
+uint32_t metric_profile_locks_type1 = 0;
+uint32_t metric_profile_locks_type2 = 0;
+uint32_t metric_gap_detected = 0;
+uint32_t metric_packet_candidates = 0;
+uint32_t metric_packet_invalid_len = 0;
+uint32_t metric_repeat_hits = 0;
+uint32_t metric_consensus_hits = 0;
+uint8_t metric_max_bits = 0;
+
+enum DecoderProfile : uint8_t
+{
+    PROFILE_UNKNOWN = 0,
+    PROFILE_TYPE1 = 1,
+    PROFILE_TYPE2 = 2,
+};
+
+DecoderProfile activeProfile = PROFILE_UNKNOWN;
+bool waitForPacketStart = true;
+
+uint64_t workBits = 0;
+uint8_t workBitCount = 0;
+
+uint64_t lastCandidateBits = 0;
+uint8_t lastCandidateBitsCount = 0;
+DecoderProfile lastCandidateProfile = PROFILE_UNKNOWN;
+uint8_t lastCandidateRepeatCount = 0;
+
+uint32_t lockScoreType1 = 0;
+uint32_t lockScoreType2 = 0;
+uint8_t lockSamples = 0;
+
+static inline uint16_t absDiffU16(uint16_t a, uint16_t b)
+{
+    return (a > b) ? (a - b) : (b - a);
+}
+
+static inline uint16_t timingTolUs(uint16_t nominal)
+{
+    uint16_t pct = nominal / 5; // 20%
+    return (pct < 250) ? 250 : pct;
+}
+
+static inline bool inWindow(uint16_t value, uint16_t nominal)
+{
+    uint16_t tol = timingTolUs(nominal);
+    return (value >= (nominal - tol) && value <= (nominal + tol));
+}
+
+static inline uint8_t classifySymbol(uint16_t dt, DecoderProfile profile)
+{
+    if (profile == PROFILE_TYPE1)
+    {
+        if (inWindow(dt, TYPE1_SHORT_US))
+            return 0;
+        if (inWindow(dt, TYPE1_LONG_US))
+            return 1;
+        return 0xFF;
+    }
+    if (profile == PROFILE_TYPE2)
+    {
+        if (inWindow(dt, TYPE2_SHORT_US))
+            return 0;
+        if (inWindow(dt, TYPE2_LONG_US))
+            return 1;
+        return 0xFF;
+    }
+    return 0xFF;
+}
+
+static inline uint16_t profileLongUs(DecoderProfile profile)
+{
+    return (profile == PROFILE_TYPE2) ? TYPE2_LONG_US : TYPE1_LONG_US;
+}
+
+static inline void resetPacketAssembler()
+{
+    workBits = 0;
+    workBitCount = 0;
+}
+
+static inline void resetProfileLock()
+{
+    activeProfile = PROFILE_UNKNOWN;
+    lockScoreType1 = 0;
+    lockScoreType2 = 0;
+    lockSamples = 0;
+    waitForPacketStart = true;
+    resetPacketAssembler();
+}
+
+static inline bool popIsrDuration(uint16_t *outDt)
+{
+    bool hasItem = false;
+    noInterrupts();
+    if (isrTail != isrHead)
+    {
+        *outDt = isrDurations[isrTail];
+        isrTail = (isrTail + 1) & ISR_QUEUE_MASK;
+        hasItem = true;
+    }
+    interrupts();
+    return hasItem;
+}
+
+void emitDecoderEvent(const char *eventType, uint16_t dt, bool includePacket)
+{
+    JsonDocument doc;
+    doc["type"] = eventType;
+    doc["dt_us"] = dt;
+    doc["profile"] = (activeProfile == PROFILE_TYPE1) ? "type1" : ((activeProfile == PROFILE_TYPE2) ? "type2" : "unknown");
+    doc["lock_samples"] = lockSamples;
+
+    if (includePacket)
+    {
+        doc["bits_captured"] = workBitCount;
+        char hexStr[32];
+        snprintf(hexStr, sizeof(hexStr), "0x%016llX", workBits);
+        doc["raw_hex"] = hexStr;
+        doc["repeat_count"] = lastCandidateRepeatCount;
+    }
+
+    char jsonBuffer[256];
+    serializeJson(doc, jsonBuffer);
+    sendUdp(jsonBuffer);
+}
+
+static inline void finalizeCandidate(uint16_t boundaryDt)
+{
+    if (workBitCount == 0)
+        return;
+
+    if (workBitCount > metric_max_bits)
+        metric_max_bits = workBitCount;
+
+    if (workBitCount < PACKET_MIN_BITS || workBitCount > PACKET_MAX_BITS)
+    {
+        metric_packet_invalid_len++;
+        resetPacketAssembler();
+        return;
+    }
+
+    metric_packet_candidates++;
+
+    if (lastCandidateProfile == activeProfile &&
+        lastCandidateBitsCount == workBitCount &&
+        lastCandidateBits == workBits)
+    {
+        if (lastCandidateRepeatCount < 255)
+            lastCandidateRepeatCount++;
+        metric_repeat_hits++;
+    }
+    else
+    {
+        lastCandidateProfile = activeProfile;
+        lastCandidateBitsCount = workBitCount;
+        lastCandidateBits = workBits;
+        lastCandidateRepeatCount = 1;
+    }
+
+    if (lastCandidateRepeatCount >= 2)
+    {
+        metric_consensus_hits++;
+        emitDecoderEvent("decoder_consensus", boundaryDt, true);
+    }
+    else
+    {
+        emitDecoderEvent("decoder_candidate", boundaryDt, true);
+    }
+
+    resetPacketAssembler();
+}
+
 IRAM_ATTR void rf_edge_isr()
 {
-    metric_total_edges++;
     static unsigned long lastRisingTime = 0;
 
     unsigned long now = micros();
-    unsigned long duration = now - lastRisingTime;
-    lastRisingTime = now;
-
-    // Glitch protector: ignore edges that double-trigger too fast
-    if (duration < 1000)
-        return; // Ignore fast double-triggers
-
-    // Evaluate the total cycle length from the previous rising edge to this one
-    bool isShort = (duration > (CYCLE_SHORT_EXPECTED - PDM_TOLERANCE) && duration < (CYCLE_SHORT_EXPECTED + PDM_TOLERANCE));
-    bool isLong = (duration > (CYCLE_LONG_EXPECTED - PDM_TOLERANCE) && duration < (CYCLE_LONG_EXPECTED + PDM_TOLERANCE));
-
-    // A packet preamble or sync gap typically presents as a huge duration (>8000us)
-    if (!isShort && !isLong)
+    if (lastRisingTime == 0)
     {
-        // Always track the deepest frame seen, whether it succeeds or not
-        if (bitCount > metric_max_bits)
-            metric_max_bits = bitCount;
-
-        // Trailing Sync Gap: If we've collected a plausible data frame size,
-        // flag it as complete for the main loop to evaluate.
-        if (bitCount >= 28 && bitCount <= 44)
-        {
-            packetReady = true;
-        }
-        else
-        {
-            bitCount = 0;
-            rxBuffer = 0;
-        }
-        metric_bad_timings++;
+        lastRisingTime = now;
         return;
     }
-    // Shift data bits only if the buffer hasn't been locked by the main loop execution
-    // Inside the bit-shifting block of rf_edge_isr():
-    if (!packetReady)
+
+    unsigned long rawDuration = now - lastRisingTime;
+    lastRisingTime = now;
+    metric_total_edges++;
+
+    if (rawDuration < GLITCH_MIN_US)
     {
-        uint8_t sampledBit = isLong ? 1 : 0;
-
-        // Pack LSB-First: Always shift incoming bits into the highest slot
-        rxBuffer = (rxBuffer >> 1) | ((uint64_t)sampledBit << 63);
-        bitCount++;
-
-        // Safety hard stop if noise runs wild
-        if (bitCount >= 60)
-        {
-            bitCount = 0;
-            rxBuffer = 0;
-        }
+        metric_glitch_edges++;
+        return;
     }
+
+    uint16_t duration = (rawDuration > 65535UL) ? 65535 : (uint16_t)rawDuration;
+    uint8_t nextHead = (isrHead + 1) & ISR_QUEUE_MASK;
+    if (nextHead == isrTail)
+    {
+        metric_queue_overflow++;
+        return;
+    }
+
+    isrDurations[isrHead] = duration;
+    isrHead = nextHead;
 }
 
 void setup()
@@ -147,6 +309,97 @@ void loop()
 
     unsigned long currentMillis = millis();
 
+    // Consume queued timing intervals from ISR and run instrumentation decoder state machine.
+    uint16_t dt = 0;
+    while (popIsrDuration(&dt))
+    {
+        metric_processed_intervals++;
+
+        if (dt >= TRAIN_RESET_US)
+        {
+            metric_train_resets++;
+            finalizeCandidate(dt);
+            resetProfileLock();
+            continue;
+        }
+
+        if (activeProfile == PROFILE_UNKNOWN)
+        {
+            uint16_t d1 = absDiffU16(dt, TYPE1_SHORT_US);
+            uint16_t d2 = absDiffU16(dt, TYPE1_LONG_US);
+            lockScoreType1 += (d1 < d2) ? d1 : d2;
+
+            uint16_t d3 = absDiffU16(dt, TYPE2_SHORT_US);
+            uint16_t d4 = absDiffU16(dt, TYPE2_LONG_US);
+            lockScoreType2 += (d3 < d4) ? d3 : d4;
+
+            if (lockSamples < 255)
+                lockSamples++;
+
+            bool canLock = false;
+            if (lockSamples >= PROFILE_LOCK_MIN_SAMPLES)
+            {
+                uint32_t scoreDiff = (lockScoreType1 > lockScoreType2) ? (lockScoreType1 - lockScoreType2) : (lockScoreType2 - lockScoreType1);
+                if (scoreDiff > ((uint32_t)lockSamples * 120))
+                    canLock = true;
+            }
+
+            if (!canLock && lockSamples >= PROFILE_LOCK_FORCE_SAMPLES)
+                canLock = true;
+
+            if (canLock)
+            {
+                activeProfile = (lockScoreType1 <= lockScoreType2) ? PROFILE_TYPE1 : PROFILE_TYPE2;
+                waitForPacketStart = true;
+                if (activeProfile == PROFILE_TYPE1)
+                    metric_profile_locks_type1++;
+                else
+                    metric_profile_locks_type2++;
+
+                emitDecoderEvent("decoder_profile_lock", dt, false);
+            }
+            continue;
+        }
+
+        uint8_t bitVal = classifySymbol(dt, activeProfile);
+        if (bitVal != 0xFF)
+        {
+            if (!waitForPacketStart)
+            {
+                workBits = (workBits << 1) | bitVal;
+                if (workBitCount < 255)
+                    workBitCount++;
+
+                if (workBitCount >= 64)
+                {
+                    metric_bad_intervals++;
+                    resetPacketAssembler();
+                    waitForPacketStart = true;
+                }
+            }
+            continue;
+        }
+
+        uint16_t gapFloor = (uint16_t)(profileLongUs(activeProfile) + (profileLongUs(activeProfile) / 2));
+        if (dt >= gapFloor)
+        {
+            metric_gap_detected++;
+            if (waitForPacketStart)
+            {
+                // First gap after lock marks a packet boundary; start collecting from next symbol.
+                waitForPacketStart = false;
+                resetPacketAssembler();
+            }
+            else
+            {
+                finalizeCandidate(dt);
+            }
+            continue;
+        }
+
+        metric_bad_intervals++;
+    }
+
     // Periodic 5-second instrumentation diagnostics report
     if (currentMillis - last_stats_report >= 5000)
     {
@@ -158,123 +411,62 @@ void loop()
         // Perform an atomic read-and-clear of volatile metric registers
         noInterrupts();
         uint32_t totalEdges = metric_total_edges;
-        uint32_t badTimings = metric_bad_timings;
+        uint32_t glitchEdges = metric_glitch_edges;
+        uint32_t queueOverflow = metric_queue_overflow;
+        uint32_t processedIntervals = metric_processed_intervals;
+        uint32_t badIntervals = metric_bad_intervals;
+        uint32_t trainResets = metric_train_resets;
+        uint32_t lockType1 = metric_profile_locks_type1;
+        uint32_t lockType2 = metric_profile_locks_type2;
+        uint32_t gaps = metric_gap_detected;
+        uint32_t packetCandidates = metric_packet_candidates;
+        uint32_t packetInvalidLen = metric_packet_invalid_len;
+        uint32_t repeatHits = metric_repeat_hits;
+        uint32_t consensusHits = metric_consensus_hits;
         uint8_t maxBits = metric_max_bits;
 
         // Reset diagnostic metrics for the next tracking window
         metric_total_edges = 0;
-        metric_bad_timings = 0;
+        metric_glitch_edges = 0;
+        metric_queue_overflow = 0;
+        metric_processed_intervals = 0;
+        metric_bad_intervals = 0;
+        metric_train_resets = 0;
+        metric_profile_locks_type1 = 0;
+        metric_profile_locks_type2 = 0;
+        metric_gap_detected = 0;
+        metric_packet_candidates = 0;
+        metric_packet_invalid_len = 0;
+        metric_repeat_hits = 0;
+        metric_consensus_hits = 0;
         metric_max_bits = 0;
         interrupts();
 
         // Package up diagnostics payload
         JsonDocument statsDoc;
-        statsDoc["type"] = "rfrx_metrics";
+        statsDoc["type"] = "decoder_metrics";
         statsDoc["total_edges"] = totalEdges;
-        statsDoc["bad_timings"] = badTimings;
+        statsDoc["glitch_edges"] = glitchEdges;
+        statsDoc["queue_overflow"] = queueOverflow;
+        statsDoc["processed_intervals"] = processedIntervals;
+        statsDoc["bad_intervals"] = badIntervals;
+        statsDoc["train_resets"] = trainResets;
+        statsDoc["locks_type1"] = lockType1;
+        statsDoc["locks_type2"] = lockType2;
+        statsDoc["gap_detected"] = gaps;
+        statsDoc["packet_candidates"] = packetCandidates;
+        statsDoc["packet_invalid_len"] = packetInvalidLen;
+        statsDoc["repeat_hits"] = repeatHits;
+        statsDoc["consensus_hits"] = consensusHits;
         statsDoc["max_bit_depth"] = maxBits;
+        statsDoc["active_profile"] = (activeProfile == PROFILE_TYPE1) ? "type1" : ((activeProfile == PROFILE_TYPE2) ? "type2" : "unknown");
+        statsDoc["wait_for_packet_start"] = waitForPacketStart;
 
-        char statsBuffer[256];
+        char statsBuffer[2048];
         serializeJson(statsDoc, statsBuffer);
         sendUdp(statsBuffer);
     }
 
-    // Process valid decoded RF packets caught by the ISR
-    if (packetReady)
-    {
-        noInterrupts();
-        uint64_t capturedFrame = rxBuffer;
-        uint8_t capturedCount = bitCount;
-
-        rxBuffer = 0;
-        bitCount = 0;
-        packetReady = false;
-        interrupts();
-
-        // Right-align the payload bits inside a working 64-bit space
-        // because LSB packing places shorter streams on the left side (MSB end)
-        capturedFrame = capturedFrame >> (64 - capturedCount);
-
-        JsonDocument doc;
-        doc["bits_captured"] = capturedCount;
-
-        char hexStr[32];
-        snprintf(hexStr, sizeof(hexStr), "0x%011llX", capturedFrame);
-        doc["raw_hex"] = hexStr;
-
-        if (capturedCount >= 28 && capturedCount <= 34)
-        {
-            // Lambda function to reverse bit order within a single byte
-            auto reverseByte = [](uint8_t b) -> uint8_t
-            {
-                b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
-                b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
-                b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
-                return b;
-            };
-
-            // Reverse every byte individually to correct the hardware reflection
-            uint8_t r0 = reverseByte((capturedFrame >> 24) & 0xFF);
-            uint8_t r1 = reverseByte((capturedFrame >> 16) & 0xFF);
-            uint8_t r2 = reverseByte((capturedFrame >> 8) & 0xFF);
-            uint8_t r3 = reverseByte(capturedFrame & 0xFF);
-
-            doc["r0"] = r0;
-            doc["r1"] = r1;
-            doc["r2"] = r2;
-            doc["r3"] = r3;
-
-            // r3 = first transmitted byte = sensor rolling ID
-            // r0 = last transmitted byte = checksum (varies per burst)
-            char idStr[8];
-            snprintf(idStr, sizeof(idStr), "0x%02X", r3);
-            doc["sensor_id"] = idStr;
-            doc["type"] = "Temp Only";
-
-            // Auriol protocol: byte1=r2 carries batt+channel+temp_MSB_nibble,
-            // byte2=r1 carries temp LSB byte. Together they form a 12-bit signed
-            // temperature value in units of 0.1°C (two's complement).
-            int16_t raw_temp = ((int16_t)(r2 & 0x0F) << 8) | r1;
-            if (raw_temp >= 2048) raw_temp -= 4096; // sign-extend 12-bit to 16-bit
-
-            float final_temp = raw_temp / 10.0;
-
-            doc["temperature_c"] = final_temp;
-            // r2 bit 7 = battery low flag; bit 6 = TX sequence counter (toggles each burst)
-            doc["battery"] = (r2 & 0x80) ? "Low" : "OK";
-        }
-        else if (capturedCount >= 38 && capturedCount <= 44)
-        {
-            // --- PROFILE B: Temp & Humidity Combined (Typically 40 Bits) ---
-            uint8_t b0 = (capturedFrame >> 32) & 0xFF;
-            uint8_t b1 = (capturedFrame >> 24) & 0xFF; // Stable ID
-            uint8_t b2 = (capturedFrame >> 16) & 0xFF;
-            uint8_t b3 = (capturedFrame >> 8) & 0xFF;
-            uint8_t b4 = capturedFrame & 0xFF;
-
-            doc["b0"] = b0;
-            doc["b1"] = b1;
-            doc["b2"] = b2;
-            doc["b3"] = b3;
-            doc["b4"] = b4;
-
-            char idStr[8];
-            snprintf(idStr, sizeof(idStr), "0x%02X", b1);
-            doc["sensor_id"] = idStr;
-            doc["type"] = "Temp + Hum";
-
-            // Combined extraction block for longer variant mapping
-            uint16_t raw_temp = (b2 << 4) | (b3 >> 4);
-            doc["temperature_c"] = (raw_temp - 400) / 10.0;
-
-            // Extract humidity (usually maps cleanly on b3 trailing nibble or b4)
-            doc["humidity"] = b4;
-        }
-
-        char jsonBuffer[256];
-        serializeJson(doc, jsonBuffer);
-        sendUdp(jsonBuffer);
-    }
     // Yield execution to protect core ESP8266 Wi-Fi context layers
     yield();
 }
