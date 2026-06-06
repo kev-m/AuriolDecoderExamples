@@ -1,5 +1,5 @@
 /**
- * Project: ESP-01S Direct PWM / Hardware Timer DCF77 Transmitter
+ * Project: ESP-01S 433MHz Auriol sensor decoder (Type 1: Temperature)
  * Version: 1.0
  * Target:  ESP8266 (ESP-01S)
  * * Pinout Allocation:
