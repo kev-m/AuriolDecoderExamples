@@ -385,8 +385,8 @@ static inline void finalizeCandidate(uint16_t boundaryDt, bool allowEmit)
         // Process payloads only on first consensus event.
         if (activeProfile == PROFILE_TYPE1)
             emitType1DecodeEvent(workBits, workBitCount, boundaryDt);
-            else if (activeProfile == PROFILE_TYPE2)
-                emitType2DecodeEvent(workBits, workBitCount, boundaryDt);
+        else if (activeProfile == PROFILE_TYPE2)
+            emitType2DecodeEvent(workBits, workBitCount, boundaryDt);
 
         lastCandidateConsensusSent = true;
     }
@@ -551,7 +551,7 @@ void loop()
             }
             else
             {
-                    finalizeCandidate(dt, true);
+                finalizeCandidate(dt, true);
             }
             continue;
         }
@@ -560,7 +560,8 @@ void loop()
     }
 
     // Periodic 5-second instrumentation diagnostics report
-    if (currentMillis - last_stats_report >= 5000)
+    bool stats = false;
+    if (stats & currentMillis - last_stats_report >= 5000)
     {
         // Prepare for payload
         sendDebug(34);
