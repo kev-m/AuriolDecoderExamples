@@ -344,14 +344,17 @@ static inline void emitType2DecodeEvent(uint64_t rawBits, uint8_t bitCount, uint
         float finalTemp = rawTemp / 10.0f;
 
         // Updated mapping from validated captures:
-        // humidity maps directly to the low byte, channel maps from n2 LSB.
+        // humidity maps directly to the low byte, channel maps from n2 low bits.
+        // n2 bit3 carries battery status: 0 = Low, 1 = OK.
         uint8_t humidity = (uint8_t)((n7 << 4) | n8);
         uint8_t channel = (n2 & 0x03) + 1;
+        bool batteryOk = (n2 & 0x08) != 0;
 
         doc["decoded"] = true;
         doc["temperature_c"] = finalTemp;
         doc["humidity"] = humidity;
         doc["channel"] = channel;
+        doc["battery"] = batteryOk ? "OK" : "Low";
 
         char idStr[8];
         snprintf(idStr, sizeof(idStr), "0x%01X%01X", n0, n1);
