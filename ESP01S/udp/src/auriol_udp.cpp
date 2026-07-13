@@ -72,6 +72,29 @@ void onSensorPacket(uint16_t sensor_id, uint8_t channel, float temperature_c, ui
 
     sendUdp(jsonBuffer);
 }
+// Useful for reverse engineering a payload (e.g. finding the real battery bit).
+void onRawFrame(uint8_t profile, uint64_t raw_bits, uint8_t bit_count, uint8_t repeat_count) {
+  const char *profileName = (profile == AURIOL_PROFILE_TYPE1) ? "Type1" :
+                             (profile == AURIOL_PROFILE_TYPE2) ? "Type2" : "Unknown";
+
+    sendDebug(14);
+    char jsonBuffer[1024];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+        "{"
+        "\"type\":\"Auriol\","
+        "\"profile\":\"%4s\","
+        "\"raw_bits\":\"0x%016llX\","
+        "\"bit_count\":%u,"
+        "\"repeat_count\":%u"
+        "}",
+        profileName, 
+        raw_bits, 
+        bit_count, 
+        repeat_count
+    );
+
+    sendUdp(jsonBuffer);
+}
 /////////////////////////////////////////////////////////////////////////////
 void setup()
 {
@@ -82,6 +105,7 @@ void setup()
     // 2. Attach the Manchester edge processing ISR
     // Initialize decoder
     auriolDecoderSetup(RF_DATA_PIN, onSensorPacket);
+    auriolDecoderSetDebugCallback(onRawFrame);  
 
     // 3. Network initialization
     wifi_enable();
