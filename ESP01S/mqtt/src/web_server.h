@@ -29,6 +29,8 @@ const char html_page[] PROGMEM = R"=====(
         button:hover { background: #45a049; }
         .delete-btn { background: #f44336; }
         .delete-btn:hover { background: #da190b; }
+        .reboot-btn { background: #ff9800; }
+        .reboot-btn:hover { background: #e68a00; }
         .status { padding: 10px; margin: 10px 0; border-radius: 4px; display: none; }
         .status.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .status.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
@@ -62,6 +64,9 @@ const char html_page[] PROGMEM = R"=====(
             <tbody>
             </tbody>
         </table>
+
+        <h2>Device</h2>
+        <button class="reboot-btn" onclick="rebootDevice()">Reboot</button>
     </div>
 
     <script>
@@ -125,6 +130,14 @@ const char html_page[] PROGMEM = R"=====(
                     }
                 })
                 .catch(e => showStatus('Error deleting mapping', 'error'));
+        }
+
+        function rebootDevice() {
+            if (!confirm('Reboot the device?')) return;
+            fetch('/api/reboot', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => showStatus('Rebooting...', 'success'))
+                .catch(e => showStatus('Error sending reboot request', 'error'));
         }
 
         function showStatus(msg, type) {
@@ -204,10 +217,18 @@ void handleDeleteMapping() {
     webServer.send(200, "application/json", "{\"success\":true}");
 }
 
+void handleReboot() {
+    webServer.send(200, "application/json", "{\"success\":true}");
+    webServer.client().flush();
+    delay(200);
+    ESP.restart();
+}
+
 void setupWebServer() {
     webServer.on("/", HTTP_GET, handleRoot);
     webServer.on("/api/mappings", HTTP_GET, handleGetMappings);
     webServer.on("/api/mappings", HTTP_POST, handlePostMapping);
+    webServer.on("/api/reboot", HTTP_POST, handleReboot);
     webServer.onNotFound([]() {
         if (webServer.method() == HTTP_DELETE) {
             handleDeleteMapping();
