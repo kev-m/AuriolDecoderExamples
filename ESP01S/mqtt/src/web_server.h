@@ -79,8 +79,8 @@ const char html_page[] PROGMEM = R"=====(
                     data.mappings.forEach(m => {
                         const row = document.createElement('tr');
                         row.innerHTML = '<td>' + m.sensor_id + '</td><td>' + m.name +
-                                        '</td><td><button class="delete-btn" onclick="deleteMapping(' +
-                                        m.sensor_id + ')">Delete</button></td>';
+                                        '</td><td><button class="delete-btn" onclick="deleteMapping(\'' +
+                                        m.sensor_id + '\')">Delete</button></td>';
                         tbody.appendChild(row);
                     });
                 })
