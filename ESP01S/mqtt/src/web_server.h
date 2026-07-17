@@ -47,6 +47,11 @@ const char html_page[] PROGMEM = R"=====(
             <input type="text" id="sensorId" placeholder="e.g., 60, 61, E6">
             <label for="sensorName" style="margin-top: 10px;">Friendly Name:</label>
             <input type="text" id="sensorName" placeholder="e.g., lounge, outside">
+            <label for="sensorOffset" style="margin-top: 10px;">Offset (&deg;C):</label>
+            <input type="number" step="any" id="sensorOffset" placeholder="0.0">
+            <label for="sensorScale" style="margin-top: 10px;">Scale:</label>
+            <input type="number" step="any" id="sensorScale" placeholder="1.0">
+            <p style="color:#666;font-size:0.85em;margin:8px 0;">Correction: T = scale &times; raw + offset. Leave as 0 / 1 to do nothing.</p>
             <button onclick="addMapping()">Add/Update</button>
         </div>
 
@@ -58,6 +63,8 @@ const char html_page[] PROGMEM = R"=====(
                 <tr>
                     <th>Sensor ID</th>
                     <th>Friendly Name</th>
+                    <th>Offset</th>
+                    <th>Scale</th>
                     <th>Action</th>
                 </tr>
             </thead>
@@ -77,9 +84,15 @@ const char html_page[] PROGMEM = R"=====(
                     const tbody = document.querySelector('#mappingsTable tbody');
                     tbody.innerHTML = '';
                     data.mappings.forEach(m => {
+                        const offset = (m.offset !== undefined ? m.offset : 0);
+                        const scale = (m.scale !== undefined ? m.scale : 1);
                         const row = document.createElement('tr');
                         row.innerHTML = '<td>' + m.sensor_id + '</td><td>' + m.name +
-                                        '</td><td><button class="delete-btn" onclick="deleteMapping(\'' +
+                                        '</td><td>' + offset.toFixed(3) +
+                                        '</td><td>' + scale.toFixed(3) +
+                                        '</td><td><button onclick="editMapping(\'' + m.sensor_id +
+                                        '\',\'' + m.name + '\',' + offset + ',' + scale + ')">Edit</button>' +
+                                        '<button class="delete-btn" onclick="deleteMapping(\'' +
                                         m.sensor_id + '\')">Delete</button></td>';
                         tbody.appendChild(row);
                     });
@@ -87,16 +100,29 @@ const char html_page[] PROGMEM = R"=====(
                 .catch(e => showStatus('Error loading mappings', 'error'));
         }
 
+        function editMapping(id, name, offset, scale) {
+            document.getElementById('sensorId').value = id;
+            document.getElementById('sensorName').value = name;
+            document.getElementById('sensorOffset').value = offset;
+            document.getElementById('sensorScale').value = scale;
+            window.scrollTo(0, 0);
+        }
+
         function addMapping() {
             const id = document.getElementById('sensorId').value.trim();
             const name = document.getElementById('sensorName').value.trim();
+            const offsetVal = document.getElementById('sensorOffset').value.trim();
+            const scaleVal = document.getElementById('sensorScale').value.trim();
 
             if (!id || !name) {
                 showStatus('Please enter both Sensor ID and Friendly Name', 'error');
                 return;
             }
 
-            const payload = JSON.stringify({sensor_id: id, name: name});
+            const offset = offsetVal === '' ? 0 : parseFloat(offsetVal);
+            const scale = scaleVal === '' ? 1 : parseFloat(scaleVal);
+
+            const payload = JSON.stringify({sensor_id: id, name: name, offset: offset, scale: scale});
             fetch('/api/mappings', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -108,6 +134,8 @@ const char html_page[] PROGMEM = R"=====(
                     showStatus('Mapping saved successfully', 'success');
                     document.getElementById('sensorId').value = '';
                     document.getElementById('sensorName').value = '';
+                    document.getElementById('sensorOffset').value = '';
+                    document.getElementById('sensorScale').value = '';
                     loadMappings();
                 } else {
                     showStatus(data.error || 'Failed to save mapping', 'error');
@@ -172,7 +200,11 @@ void handleGetMappings() {
         json += String(mappings[i].sensor_id, HEX);
         json += "\",\"name\":\"";
         json += mappings[i].name;
-        json += "\"}";
+        json += "\",\"offset\":";
+        json += String(mappings[i].offset, 3);
+        json += ",\"scale\":";
+        json += String(mappings[i].scale, 3);
+        json += "}";
     }
     json += "]}";
 
@@ -200,8 +232,29 @@ void handlePostMapping() {
         return;
     }
 
+    // Optional numeric correction fields; default to identity (offset 0, scale 1).
+    float offset = 0.0f;
+    float scale = 1.0f;
+
+    int offsetStart = body.indexOf("\"offset\":");
+    if (offsetStart >= 0) {
+        offsetStart += 9;
+        int offsetEnd = body.indexOf(",", offsetStart);
+        if (offsetEnd < 0) offsetEnd = body.indexOf("}", offsetStart);
+        offset = body.substring(offsetStart, offsetEnd).toFloat();
+    }
+
+    int scaleStart = body.indexOf("\"scale\":");
+    if (scaleStart >= 0) {
+        scaleStart += 8;
+        int scaleEnd = body.indexOf(",", scaleStart);
+        if (scaleEnd < 0) scaleEnd = body.indexOf("}", scaleStart);
+        scale = body.substring(scaleStart, scaleEnd).toFloat();
+        if (scale == 0.0f) scale = 1.0f; // Guard against a zeroed-out scale
+    }
+
     uint16_t sensor_id = (uint16_t)strtol(idStr.c_str(), NULL, 16);
-    sensorMappings.setMapping(sensor_id, nameStr.c_str());
+    sensorMappings.setMapping(sensor_id, nameStr.c_str(), offset, scale);
 
     webServer.send(200, "application/json", "{\"success\":true}");
 }

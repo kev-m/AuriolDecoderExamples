@@ -12,6 +12,8 @@
 typedef struct {
     uint16_t sensor_id;
     char name[MAX_NAME_LENGTH];
+    float offset; // Temperature correction: T_corrected = scale * T_raw + offset
+    float scale;  // Default identity: offset = 0.0, scale = 1.0 (do nothing)
 } sensor_mapping_t;
 
 class SensorMappings {
@@ -36,22 +38,42 @@ private:
     void parseLine(const char* line) {
         if (mapping_count >= MAX_MAPPINGS) return;
 
-        char temp[MAX_NAME_LENGTH + 10];
+        char temp[MAX_NAME_LENGTH + 40];
         strncpy(temp, line, sizeof(temp) - 1);
         temp[sizeof(temp) - 1] = '\0';
 
+        // Fields: id,name[,offset,scale]  (offset/scale optional for backward compat)
         char* comma = strchr(temp, ',');
         if (!comma) return;
-
         *comma = '\0';
         char* id_str = temp;
         char* name_str = comma + 1;
+
+        // Correction defaults to identity (do nothing) when fields are absent.
+        float offset = 0.0f;
+        float scale = 1.0f;
+
+        char* offset_str = strchr(name_str, ',');
+        if (offset_str) {
+            *offset_str = '\0';
+            offset_str++;
+            char* scale_str = strchr(offset_str, ',');
+            if (scale_str) {
+                *scale_str = '\0';
+                scale_str++;
+                scale = (float)atof(scale_str);
+            }
+            offset = (float)atof(offset_str);
+        }
 
         uint16_t id = (uint16_t)strtol(id_str, NULL, 16);
 
         for (int i = 0; i < mapping_count; i++) {
             if (mappings[i].sensor_id == id) {
                 strncpy(mappings[i].name, name_str, MAX_NAME_LENGTH - 1);
+                mappings[i].name[MAX_NAME_LENGTH - 1] = '\0';
+                mappings[i].offset = offset;
+                mappings[i].scale = scale;
                 return;
             }
         }
@@ -59,6 +81,8 @@ private:
         mappings[mapping_count].sensor_id = id;
         strncpy(mappings[mapping_count].name, name_str, MAX_NAME_LENGTH - 1);
         mappings[mapping_count].name[MAX_NAME_LENGTH - 1] = '\0';
+        mappings[mapping_count].offset = offset;
+        mappings[mapping_count].scale = scale;
         mapping_count++;
     }
 
@@ -95,7 +119,9 @@ public:
         if (!file) return;
 
         for (int i = 0; i < mapping_count; i++) {
-            file.printf("%02X,%s\n", mappings[i].sensor_id, mappings[i].name);
+            file.printf("%02X,%s,%.3f,%.3f\n",
+                        mappings[i].sensor_id, mappings[i].name,
+                        mappings[i].offset, mappings[i].scale);
         }
         file.close();
     }
@@ -109,11 +135,24 @@ public:
         return nullptr;
     }
 
-    void setMapping(uint16_t sensor_id, const char* name) {
+    // Apply the per-sensor linear correction: T_corrected = scale * T_raw + offset.
+    // Unmapped sensors are returned unchanged (identity).
+    float applyCorrection(uint16_t sensor_id, float temperature_c) {
+        for (int i = 0; i < mapping_count; i++) {
+            if (mappings[i].sensor_id == sensor_id) {
+                return mappings[i].scale * temperature_c + mappings[i].offset;
+            }
+        }
+        return temperature_c;
+    }
+
+    void setMapping(uint16_t sensor_id, const char* name, float offset, float scale) {
         for (int i = 0; i < mapping_count; i++) {
             if (mappings[i].sensor_id == sensor_id) {
                 strncpy(mappings[i].name, name, MAX_NAME_LENGTH - 1);
                 mappings[i].name[MAX_NAME_LENGTH - 1] = '\0';
+                mappings[i].offset = offset;
+                mappings[i].scale = scale;
                 saveMappings();
                 return;
             }
@@ -123,6 +162,8 @@ public:
             mappings[mapping_count].sensor_id = sensor_id;
             strncpy(mappings[mapping_count].name, name, MAX_NAME_LENGTH - 1);
             mappings[mapping_count].name[MAX_NAME_LENGTH - 1] = '\0';
+            mappings[mapping_count].offset = offset;
+            mappings[mapping_count].scale = scale;
             mapping_count++;
             saveMappings();
         }

@@ -120,7 +120,7 @@ void onRawFrame(uint8_t profile, uint64_t raw_bits, uint8_t bit_count, uint8_t r
   const char *profileName = (profile == AURIOL_PROFILE_TYPE1) ? "Type1" :
                              (profile == AURIOL_PROFILE_TYPE2) ? "Type2" : "Unknown";
 
-    sendDebug(14);
+    //sendDebug(14);
     char jsonBuffer[1024];
     snprintf(jsonBuffer, sizeof(jsonBuffer),
         "{"
@@ -178,6 +178,9 @@ void publish_topics(void)
         {
             sensor_t* sensor = &sensor_array[i];
 
+            // Apply per-sensor linear correction (identity for unmapped sensors).
+            float corrected_temp = sensorMappings.applyCorrection(sensor->sensor_id, sensor->temperature_c);
+
             char jsonBuffer[1024];
             snprintf(jsonBuffer, sizeof(jsonBuffer),
                      "{"
@@ -191,7 +194,7 @@ void publish_topics(void)
                      "}",
                      sensor->sensor_id,
                      (unsigned int)sensor->channel,
-                     sensor->temperature_c,
+                     corrected_temp,
                      sensor->humidity_pct,
                      sensor->battery_ok ? "OK" : "Low",
                      states[sensor->status]);
@@ -242,7 +245,7 @@ void setup()
 
     // 3. Configure RF Data pin and attach interrupts
     auriolDecoderSetup(RF_DATA_PIN, onSensorPacket);
-    // auriolDecoderSetDebugCallback(onRawFrame);  
+    auriolDecoderSetDebugCallback(onRawFrame);  
 
     // 4. Initialize LittleFS and sensor mappings
     LittleFS.begin();
