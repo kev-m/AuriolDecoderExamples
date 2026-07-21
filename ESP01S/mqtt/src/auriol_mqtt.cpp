@@ -59,6 +59,19 @@ void disableRF()
     digitalWrite(RX_POWER_PIN, HIGH);
 }
 
+// Clear a persisted (retained) friendly-name topic on the broker.
+// Publishing an empty payload with the retain flag removes the retained message,
+// so a deleted friendly name doesn't leave a stale value lingering for subscribers.
+void clearRetainedTopic(const char* name)
+{
+    if (!mqttClient.connected() || name == nullptr || name[0] == '\0')
+        return;
+
+    char topic_name[64];
+    snprintf(topic_name, sizeof(topic_name), "%s/%s", mqtt_topic_prefix, name);
+    mqttClient.publish(topic_name, "", true); // empty + retain clears the topic
+}
+
 /////////////////////////////////////////////////////////////////////////////
 const char* states[3] = {"Good", "Overdue", "Offline"};
 
@@ -200,6 +213,7 @@ void publish_topics(void)
                      states[sensor->status]);
 
             char topic_name[64];
+            bool retain = false;
             const char* mapped_name = sensorMappings.getName(sensor->sensor_id);
             if (mapped_name)
             {
@@ -207,6 +221,8 @@ void publish_topics(void)
                          "%s/%s",
                          mqtt_topic_prefix,
                          mapped_name);
+                // Persist friendly-name topics so subscribers get the last value on connect.
+                retain = true;
             }
             else
             {
@@ -215,7 +231,7 @@ void publish_topics(void)
                          mqtt_topic_prefix,
                          sensor->sensor_id);
             }
-            mqttClient.publish(topic_name, jsonBuffer);
+            mqttClient.publish(topic_name, jsonBuffer, retain);
         }
     }
 }

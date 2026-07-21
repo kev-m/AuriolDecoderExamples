@@ -6,6 +6,10 @@
 
 extern SensorMappings sensorMappings;
 
+// Defined in auriol_mqtt.cpp: clears a persisted (retained) friendly-name topic
+// by publishing an empty retained payload to <prefix>/<name>.
+extern void clearRetainedTopic(const char* name);
+
 ESP8266WebServer webServer(80);
 
 const char html_page[] PROGMEM = R"=====(
@@ -254,6 +258,14 @@ void handlePostMapping() {
     }
 
     uint16_t sensor_id = (uint16_t)strtol(idStr.c_str(), NULL, 16);
+
+    // If this sensor is being renamed, clear the old friendly-name topic so its
+    // retained value doesn't linger under the previous name.
+    const char* oldName = sensorMappings.getName(sensor_id);
+    if (oldName && nameStr != oldName) {
+        clearRetainedTopic(oldName);
+    }
+
     sensorMappings.setMapping(sensor_id, nameStr.c_str(), offset, scale);
 
     webServer.send(200, "application/json", "{\"success\":true}");
@@ -265,6 +277,14 @@ void handleDeleteMapping() {
     String idStr = path.substring(lastSlash + 1);
 
     uint16_t sensor_id = (uint16_t)strtol(idStr.c_str(), NULL, 16);
+
+    // Clear the persisted friendly-name topic before removing the mapping,
+    // otherwise a stale retained value lingers on the broker forever.
+    const char* name = sensorMappings.getName(sensor_id);
+    if (name) {
+        clearRetainedTopic(name);
+    }
+
     sensorMappings.deleteMapping(sensor_id);
 
     webServer.send(200, "application/json", "{\"success\":true}");
