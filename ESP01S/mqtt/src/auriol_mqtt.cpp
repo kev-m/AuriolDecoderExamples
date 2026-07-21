@@ -261,7 +261,7 @@ void setup()
 
     // 3. Configure RF Data pin and attach interrupts
     auriolDecoderSetup(RF_DATA_PIN, onSensorPacket);
-    auriolDecoderSetDebugCallback(onRawFrame);  
+    // auriolDecoderSetDebugCallback(onRawFrame);  
 
     // 4. Initialize LittleFS and sensor mappings
     LittleFS.begin();
