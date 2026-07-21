@@ -147,6 +147,21 @@ public:
     }
 
     void setMapping(uint16_t sensor_id, const char* name, float offset, float scale) {
+        // The friendly name is the invariant: a sensor keeps its name across battery
+        // changes / reboots even though its ID changes. Match on name first so that
+        // re-adding a known name with a new ID updates the stored ID in place rather
+        // than creating a duplicate entry.
+        for (int i = 0; i < mapping_count; i++) {
+            if (strncmp(mappings[i].name, name, MAX_NAME_LENGTH) == 0) {
+                mappings[i].sensor_id = sensor_id;
+                mappings[i].offset = offset;
+                mappings[i].scale = scale;
+                saveMappings();
+                return;
+            }
+        }
+
+        // No name match: fall back to matching by ID (e.g. renaming an existing sensor).
         for (int i = 0; i < mapping_count; i++) {
             if (mappings[i].sensor_id == sensor_id) {
                 strncpy(mappings[i].name, name, MAX_NAME_LENGTH - 1);
