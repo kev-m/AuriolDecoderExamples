@@ -112,6 +112,60 @@ void wifi_enable() {
     sendDebug(DEB_VER);
 }
 
+////////////////////////////////////////////////////////////
+// Runtime WiFi health check
+////////////////////////////////////////////////////////////
+// wifi_enable() only runs once at boot. If the link drops later (AP reboot,
+// DHCP lease expiry, interference) nothing re-establishes it: wifi_enabled
+// stays true, MQTT can never reconnect, and the device goes silent without
+// rebooting. Call wifi_check() every loop pass: it nudges the SDK to
+// reconnect and, if the link stays down past WIFI_RECOVERY_TIMEOUT, reboots
+// so the device recovers on its own (matching the boot-time connect-or-restart
+// policy in wifi_enable()).
+#ifndef WIFI_RECOVERY_TIMEOUT
+#define WIFI_RECOVERY_TIMEOUT (60 * 1000UL) // Reboot after 60s of no link
+#endif
+#ifndef WIFI_RECONNECT_INTERVAL
+#define WIFI_RECONNECT_INTERVAL (5 * 1000UL) // Nudge reconnect every 5s
+#endif
+
+void wifi_check() {
+    if (!wifi_enabled) {
+        return;
+    }
+
+    static unsigned long wifi_down_since = 0; // 0 = link currently healthy
+    static unsigned long last_reconnect = 0;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifi_down_since = 0; // Clear the outage timer.
+        return;
+    }
+
+    unsigned long now = millis();
+
+    // First pass we notice the outage: start the timer and force an immediate
+    // reconnect attempt below.
+    if (wifi_down_since == 0) {
+        wifi_down_since = now;
+        last_reconnect = 0;
+        DEBUG_PRINTLN("\nWiFi link lost; attempting recovery...");
+    }
+
+    // Give up and reboot if the link has been down too long. A clean restart
+    // fully reinitialises WiFi, OTA and MQTT.
+    if (now - wifi_down_since > WIFI_RECOVERY_TIMEOUT) {
+        sendDebug(12);
+        ESP.restart();
+    }
+
+    // Periodically nudge the SDK to re-establish the connection.
+    if (last_reconnect == 0 || now - last_reconnect > WIFI_RECONNECT_INTERVAL) {
+        last_reconnect = now;
+        WiFi.reconnect();
+    }
+}
+
 void wifi_disable() {
 
     if (!wifi_enabled) {

@@ -278,6 +278,10 @@ void setup()
 
 void loop()
 {
+    // Re-establish WiFi if the link dropped since boot (reboots on prolonged
+    // outage). Without this the device goes silent and never recovers.
+    wifi_check();
+
     if (wifi_enabled)
     {
         ArduinoOTA.handle();
