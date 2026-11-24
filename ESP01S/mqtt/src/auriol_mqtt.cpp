@@ -192,7 +192,7 @@ void publish_topics(void)
             sensor_t* sensor = &sensor_array[i];
 
             // Apply per-sensor linear correction (identity for unmapped sensors).
-            float corrected_temp = sensorMappings.applyCorrection(sensor->sensor_id, sensor->temperature_c);
+            float corrected_temp = sensorMappings.applyCorrection(sensor->sensor_id, sensor->channel, sensor->temperature_c);
 
             char jsonBuffer[1024];
             snprintf(jsonBuffer, sizeof(jsonBuffer),
@@ -214,7 +214,7 @@ void publish_topics(void)
 
             char topic_name[64];
             bool retain = false;
-            const char* mapped_name = sensorMappings.getName(sensor->sensor_id);
+            const char* mapped_name = sensorMappings.getName(sensor->sensor_id, sensor->channel);
             if (mapped_name)
             {
                 snprintf(topic_name, sizeof(topic_name),

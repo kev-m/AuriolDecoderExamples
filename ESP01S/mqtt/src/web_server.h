@@ -49,6 +49,14 @@ const char html_page[] PROGMEM = R"=====(
             <h2>Add/Update Mapping</h2>
             <label for="sensorId">Sensor ID (hex):</label>
             <input type="text" id="sensorId" placeholder="e.g., 60, 61, E6">
+            <label for="sensorChannel" style="margin-top: 10px;">Channel:</label>
+            <select id="sensorChannel" style="padding:8px;width:100%;box-sizing:border-box;border:1px solid #ddd;border-radius:4px;">
+                <option value="any">Any</option>
+                <option value="0">0</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+            </select>
             <label for="sensorName" style="margin-top: 10px;">Friendly Name:</label>
             <input type="text" id="sensorName" placeholder="e.g., lounge, outside">
             <label for="sensorOffset" style="margin-top: 10px;">Offset (&deg;C):</label>
@@ -66,6 +74,7 @@ const char html_page[] PROGMEM = R"=====(
             <thead>
                 <tr>
                     <th>Sensor ID</th>
+                    <th>Channel</th>
                     <th>Friendly Name</th>
                     <th>Offset</th>
                     <th>Scale</th>
@@ -91,21 +100,25 @@ const char html_page[] PROGMEM = R"=====(
                         const offset = (m.offset !== undefined ? m.offset : 0);
                         const scale = (m.scale !== undefined ? m.scale : 1);
                         const row = document.createElement('tr');
-                        row.innerHTML = '<td>' + m.sensor_id + '</td><td>' + m.name +
+                        const ch = (m.channel < 0 ? 'any' : String(m.channel));
+                        const key = m.sensor_id + (m.channel < 0 ? '' : ':' + m.channel);
+                        row.innerHTML = '<td>' + m.sensor_id + '</td><td>' + (m.channel < 0 ? 'Any' : m.channel) +
+                                        '</td><td>' + m.name +
                                         '</td><td>' + offset.toFixed(3) +
                                         '</td><td>' + scale.toFixed(3) +
                                         '</td><td><button onclick="editMapping(\'' + m.sensor_id +
-                                        '\',\'' + m.name + '\',' + offset + ',' + scale + ')">Edit</button>' +
+                                        '\',\'' + ch + '\',\'' + m.name + '\',' + offset + ',' + scale + ')">Edit</button>' +
                                         '<button class="delete-btn" onclick="deleteMapping(\'' +
-                                        m.sensor_id + '\')">Delete</button></td>';
+                                        key + '\')">Delete</button></td>';
                         tbody.appendChild(row);
                     });
                 })
                 .catch(e => showStatus('Error loading mappings', 'error'));
         }
 
-        function editMapping(id, name, offset, scale) {
+        function editMapping(id, ch, name, offset, scale) {
             document.getElementById('sensorId').value = id;
+            document.getElementById('sensorChannel').value = ch;
             document.getElementById('sensorName').value = name;
             document.getElementById('sensorOffset').value = offset;
             document.getElementById('sensorScale').value = scale;
@@ -126,7 +139,10 @@ const char html_page[] PROGMEM = R"=====(
             const offset = offsetVal === '' ? 0 : parseFloat(offsetVal);
             const scale = scaleVal === '' ? 1 : parseFloat(scaleVal);
 
-            const payload = JSON.stringify({sensor_id: id, name: name, offset: offset, scale: scale});
+            const chVal = document.getElementById('sensorChannel').value;
+            const channel = chVal === 'any' ? -1 : parseInt(chVal);
+
+            const payload = JSON.stringify({sensor_id: id, channel: channel, name: name, offset: offset, scale: scale});
             fetch('/api/mappings', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -137,6 +153,7 @@ const char html_page[] PROGMEM = R"=====(
                 if (data.success) {
                     showStatus('Mapping saved successfully', 'success');
                     document.getElementById('sensorId').value = '';
+                    document.getElementById('sensorChannel').value = 'any';
                     document.getElementById('sensorName').value = '';
                     document.getElementById('sensorOffset').value = '';
                     document.getElementById('sensorScale').value = '';
@@ -202,7 +219,9 @@ void handleGetMappings() {
         if (i > 0) json += ",";
         json += "{\"sensor_id\":\"";
         json += String(mappings[i].sensor_id, HEX);
-        json += "\",\"name\":\"";
+        json += "\",\"channel\":";
+        json += (mappings[i].channel == MAPPING_ANY_CHANNEL) ? String(-1) : String(mappings[i].channel);
+        json += ",\"name\":\"";
         json += mappings[i].name;
         json += "\",\"offset\":";
         json += String(mappings[i].offset, 3);
@@ -259,14 +278,25 @@ void handlePostMapping() {
 
     uint16_t sensor_id = (uint16_t)strtol(idStr.c_str(), NULL, 16);
 
+    // Optional channel (-1 or absent = any channel).
+    uint8_t channel = MAPPING_ANY_CHANNEL;
+    int chStart = body.indexOf("\"channel\":");
+    if (chStart >= 0) {
+        chStart += 10;
+        int chEnd = body.indexOf(",", chStart);
+        if (chEnd < 0) chEnd = body.indexOf("}", chStart);
+        int ch = body.substring(chStart, chEnd).toInt();
+        if (ch >= 0 && ch < MAPPING_ANY_CHANNEL) channel = (uint8_t)ch;
+    }
+
     // If this sensor is being renamed, clear the old friendly-name topic so its
     // retained value doesn't linger under the previous name.
-    const char* oldName = sensorMappings.getName(sensor_id);
+    const char* oldName = sensorMappings.getNameExact(sensor_id, channel);
     if (oldName && nameStr != oldName) {
         clearRetainedTopic(oldName);
     }
 
-    sensorMappings.setMapping(sensor_id, nameStr.c_str(), offset, scale);
+    sensorMappings.setMapping(sensor_id, channel, nameStr.c_str(), offset, scale);
 
     webServer.send(200, "application/json", "{\"success\":true}");
 }
@@ -276,16 +306,18 @@ void handleDeleteMapping() {
     int lastSlash = path.lastIndexOf('/');
     String idStr = path.substring(lastSlash + 1);
 
-    uint16_t sensor_id = (uint16_t)strtol(idStr.c_str(), NULL, 16);
+    uint16_t sensor_id;
+    uint8_t channel;
+    SensorMappings::parseKey(idStr.c_str(), &sensor_id, &channel);
 
     // Clear the persisted friendly-name topic before removing the mapping,
     // otherwise a stale retained value lingers on the broker forever.
-    const char* name = sensorMappings.getName(sensor_id);
+    const char* name = sensorMappings.getNameExact(sensor_id, channel);
     if (name) {
         clearRetainedTopic(name);
     }
 
-    sensorMappings.deleteMapping(sensor_id);
+    sensorMappings.deleteMapping(sensor_id, channel);
 
     webServer.send(200, "application/json", "{\"success\":true}");
 }

@@ -8,9 +8,12 @@
 #define MAPPINGS_FILE "/mappings.csv"
 #define MAX_MAPPINGS 20
 #define MAX_NAME_LENGTH 32
+// Channel value meaning "match any channel" (used by legacy, ID-only mappings).
+#define MAPPING_ANY_CHANNEL 0xFF
 
 typedef struct {
     uint16_t sensor_id;
+    uint8_t channel; // MAPPING_ANY_CHANNEL = any; otherwise must match the sensor's channel
     char name[MAX_NAME_LENGTH];
     float offset; // Temperature correction: T_corrected = scale * T_raw + offset
     float scale;  // Default identity: offset = 0.0, scale = 1.0 (do nothing)
@@ -33,6 +36,21 @@ private:
         }
 
         saveMappings();
+    }
+
+    // Exact (id, channel) match, including the wildcard value.
+    int findExact(uint16_t id, uint8_t channel) {
+        for (int i = 0; i < mapping_count; i++) {
+            if (mappings[i].sensor_id == id && mappings[i].channel == channel) return i;
+        }
+        return -1;
+    }
+
+    // Best match for a live sensor: channel-specific entry first, then any-channel entry.
+    int findBest(uint16_t id, uint8_t channel) {
+        int i = findExact(id, channel);
+        if (i >= 0) return i;
+        return findExact(id, MAPPING_ANY_CHANNEL);
     }
 
     void parseLine(const char* line) {
@@ -66,10 +84,13 @@ private:
             offset = (float)atof(offset_str);
         }
 
-        uint16_t id = (uint16_t)strtol(id_str, NULL, 16);
+        // ID field is "<hex id>" (any channel) or "<hex id>:<channel>".
+        uint16_t id;
+        uint8_t channel;
+        parseKey(id_str, &id, &channel);
 
         for (int i = 0; i < mapping_count; i++) {
-            if (mappings[i].sensor_id == id) {
+            if (mappings[i].sensor_id == id && mappings[i].channel == channel) {
                 strncpy(mappings[i].name, name_str, MAX_NAME_LENGTH - 1);
                 mappings[i].name[MAX_NAME_LENGTH - 1] = '\0';
                 mappings[i].offset = offset;
@@ -79,6 +100,7 @@ private:
         }
 
         mappings[mapping_count].sensor_id = id;
+        mappings[mapping_count].channel = channel;
         strncpy(mappings[mapping_count].name, name_str, MAX_NAME_LENGTH - 1);
         mappings[mapping_count].name[MAX_NAME_LENGTH - 1] = '\0';
         mappings[mapping_count].offset = offset;
@@ -87,6 +109,16 @@ private:
     }
 
 public:
+    // Parse "<hex id>" or "<hex id>:<channel>". No channel => MAPPING_ANY_CHANNEL.
+    static void parseKey(const char* str, uint16_t* id, uint8_t* channel) {
+        *id = (uint16_t)strtol(str, NULL, 16);
+        *channel = MAPPING_ANY_CHANNEL;
+        const char* colon = strchr(str, ':');
+        if (colon && colon[1] != '\0') {
+            *channel = (uint8_t)atoi(colon + 1);
+        }
+    }
+
     void init() {
         if (!LittleFS.exists(MAPPINGS_FILE)) {
             createDefaultMappings();
@@ -119,34 +151,40 @@ public:
         if (!file) return;
 
         for (int i = 0; i < mapping_count; i++) {
-            file.printf("%02X,%s,%.3f,%.3f\n",
-                        mappings[i].sensor_id, mappings[i].name,
-                        mappings[i].offset, mappings[i].scale);
+            if (mappings[i].channel == MAPPING_ANY_CHANNEL) {
+                file.printf("%02X,%s,%.3f,%.3f\n",
+                            mappings[i].sensor_id, mappings[i].name,
+                            mappings[i].offset, mappings[i].scale);
+            } else {
+                file.printf("%02X:%u,%s,%.3f,%.3f\n",
+                            mappings[i].sensor_id, (unsigned)mappings[i].channel,
+                            mappings[i].name, mappings[i].offset, mappings[i].scale);
+            }
         }
         file.close();
     }
 
-    const char* getName(uint16_t sensor_id) {
-        for (int i = 0; i < mapping_count; i++) {
-            if (mappings[i].sensor_id == sensor_id) {
-                return mappings[i].name;
-            }
-        }
-        return nullptr;
+    // Name for a live sensor (channel-specific entry preferred over any-channel).
+    const char* getName(uint16_t sensor_id, uint8_t channel) {
+        int i = findBest(sensor_id, channel);
+        return i >= 0 ? mappings[i].name : nullptr;
+    }
+
+    // Name of the entry stored under exactly this (id, channel) key (for edit/delete).
+    const char* getNameExact(uint16_t sensor_id, uint8_t channel) {
+        int i = findExact(sensor_id, channel);
+        return i >= 0 ? mappings[i].name : nullptr;
     }
 
     // Apply the per-sensor linear correction: T_corrected = scale * T_raw + offset.
     // Unmapped sensors are returned unchanged (identity).
-    float applyCorrection(uint16_t sensor_id, float temperature_c) {
-        for (int i = 0; i < mapping_count; i++) {
-            if (mappings[i].sensor_id == sensor_id) {
-                return mappings[i].scale * temperature_c + mappings[i].offset;
-            }
-        }
+    float applyCorrection(uint16_t sensor_id, uint8_t channel, float temperature_c) {
+        int i = findBest(sensor_id, channel);
+        if (i >= 0) return mappings[i].scale * temperature_c + mappings[i].offset;
         return temperature_c;
     }
 
-    void setMapping(uint16_t sensor_id, const char* name, float offset, float scale) {
+    void setMapping(uint16_t sensor_id, uint8_t channel, const char* name, float offset, float scale) {
         // The friendly name is the invariant: a sensor keeps its name across battery
         // changes / reboots even though its ID changes. Match on name first so that
         // re-adding a known name with a new ID updates the stored ID in place rather
@@ -154,6 +192,7 @@ public:
         for (int i = 0; i < mapping_count; i++) {
             if (strncmp(mappings[i].name, name, MAX_NAME_LENGTH) == 0) {
                 mappings[i].sensor_id = sensor_id;
+                mappings[i].channel = channel;
                 mappings[i].offset = offset;
                 mappings[i].scale = scale;
                 saveMappings();
@@ -161,20 +200,20 @@ public:
             }
         }
 
-        // No name match: fall back to matching by ID (e.g. renaming an existing sensor).
-        for (int i = 0; i < mapping_count; i++) {
-            if (mappings[i].sensor_id == sensor_id) {
-                strncpy(mappings[i].name, name, MAX_NAME_LENGTH - 1);
-                mappings[i].name[MAX_NAME_LENGTH - 1] = '\0';
-                mappings[i].offset = offset;
-                mappings[i].scale = scale;
-                saveMappings();
-                return;
-            }
+        // No name match: fall back to matching by (ID, channel) (e.g. renaming a sensor).
+        int idx = findExact(sensor_id, channel);
+        if (idx >= 0) {
+            strncpy(mappings[idx].name, name, MAX_NAME_LENGTH - 1);
+            mappings[idx].name[MAX_NAME_LENGTH - 1] = '\0';
+            mappings[idx].offset = offset;
+            mappings[idx].scale = scale;
+            saveMappings();
+            return;
         }
 
         if (mapping_count < MAX_MAPPINGS) {
             mappings[mapping_count].sensor_id = sensor_id;
+            mappings[mapping_count].channel = channel;
             strncpy(mappings[mapping_count].name, name, MAX_NAME_LENGTH - 1);
             mappings[mapping_count].name[MAX_NAME_LENGTH - 1] = '\0';
             mappings[mapping_count].offset = offset;
@@ -184,17 +223,14 @@ public:
         }
     }
 
-    void deleteMapping(uint16_t sensor_id) {
-        for (int i = 0; i < mapping_count; i++) {
-            if (mappings[i].sensor_id == sensor_id) {
-                for (int j = i; j < mapping_count - 1; j++) {
-                    mappings[j] = mappings[j + 1];
-                }
-                mapping_count--;
-                saveMappings();
-                return;
-            }
+    void deleteMapping(uint16_t sensor_id, uint8_t channel) {
+        int i = findExact(sensor_id, channel);
+        if (i < 0) return;
+        for (int j = i; j < mapping_count - 1; j++) {
+            mappings[j] = mappings[j + 1];
         }
+        mapping_count--;
+        saveMappings();
     }
 
     void getAllMappings(sensor_mapping_t** out, uint8_t* count) {
