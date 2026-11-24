@@ -53,7 +53,12 @@ Receives messages on UDP port 4242 with format:
 
 ### MQTT Implementation
 
-Publishes to MQTT broker with topic `auriol/sensors/<sensor_id>`:
+Publishes to the MQTT broker under the prefix `home/auriol_sensor`:
+
+- Sensors with a friendly name mapping: `home/auriol_sensor/<name>` (e.g. `home/auriol_sensor/outside`), published with the retain flag.
+- Unmapped sensors: `home/auriol_sensor/ID/<sensor_id>` (4-digit hex, e.g. `home/auriol_sensor/ID/A1B2`), not retained.
+
+Subscribe to `home/auriol_sensor/#` to see everything.
 
 ```bash
 cd ESP01S/mqtt
